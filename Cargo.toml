@@ -1,0 +1,12 @@
+[workspace]
+members = ["core", "host"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# NOTE (Logos/LEZ): the RISC Zero guest build pins its own toolchain via the LEZ
+# rust-toolchain.toml and patches `sha2` to the risc0 accelerated fork in the
+# *guest* workspace. Nothing here depends on that; `le-sync-core` only needs `sha2`
+# with default-features = false.

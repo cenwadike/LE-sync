@@ -1,0 +1,23 @@
+[package]
+name = "le-sync"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "std host: fetch beacon light-client bootstrap/updates and verify SSZ Merkle branches with le-sync-core"
+
+[lib]
+name = "le_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "le-sync"
+path = "src/main.rs"
+
+[dependencies]
+le-sync-core = { path = "../core" }
+serde_json = "1"
+hex = "0.4"
+ureq = "2"
+
+[dev-dependencies]
+sha2 = { version = "0.10", default-features = false }
