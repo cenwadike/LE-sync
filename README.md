@@ -86,7 +86,7 @@ cargo run -p le-sync --release -- --source fixtures/<chain>-<date> --trusted-roo
 
 `--trusted-root` is the weak-subjectivity checkpoint: the **block root** of the first block of a
 recently finalized epoch (not an execution hash). Confirm it against 2+ independent explorers.
-The bootstrap is rejected, and the run aborts, if its header does not hash to it.
+If the header doesn't hash to it, the bootstrap is rejected and the run aborts.
 
 ## What is checked, and where it comes from
 
@@ -99,7 +99,7 @@ The bootstrap is rejected, and the run aborts, if its header does not hash to it
 | branch longer than depth: extra leading nodes must be zero | altair `is_valid_normalized_merkle_branch` |
 | gindex picked from the header **slot** vs `ELECTRA_FORK_EPOCH` (never from the branch length) | electra `*_gindex_at_slot` |
 
-Depth / subtree index: 105 → (6, 41), 169 → (7, 41), 54 → (5, 22), 86 → (6, 22).
+Depth/subtree index: 105 → (6, 41), 169 → (7, 41), 54 → (5, 22), 86 → (6, 22).
 
 **Fulu** adds only `proposer_lookahead` (38th, last `BeaconState` field; still 64 leaves), so no
 light-client gindex changes, and Electra..=Fulu light-client data uses the Electra SSZ types.
@@ -108,7 +108,7 @@ light-client gindex changes, and Electra..=Fulu light-client data uses the Elect
 **Gloas** changes the gindices and is *not* implemented. `core` returns `UnsupportedFork` for slots
 at/after `GLOAS_FORK_EPOCH`, and the host refuses `version` values newer than `fulu`
 (fail closed). Per `across-protocol/sp1-helios#92`, Sepolia forked to Gloas at epoch 353024
-(~2026-10-06), so Sepolia data after that is refused by design. Use mainnet or Hoodi, and check
+(~2026-10-06), so Sepolia data after that is intentionally rejected. Use mainnet or Hoodi, and check
 Hoodi's Gloas schedule.
 
 ## Logos / LEZ constraints honoured
@@ -116,15 +116,8 @@ Hoodi's Gloas schedule.
 * `le-sync-core` is `#![no_std]`, allocation-free, one dependency: `sha2` with
   `default-features = false`. Fixed-size arrays only (the 512-key committee root uses a 16 KiB
   stack buffer; no `Vec`).
-* No clocks, randomness, threads, network or filesystem in `core`. All I/O is in `host`.
+* No clocks, randomness, threads, network, or filesystem in `core`. All I/O is in `host`.
 * The RISC Zero guest build needs the LEZ-pinned toolchain and the risc0 `sha2` `[patch]` in the
   *guest* workspace (see `risc0/risc0` examples). That is Sprint 2's gate; nothing here blocks it.
 
-## Verification status (be precise about this before relying on it)
-
-Done in the authoring sandbox:
-* `core`: 11 unit tests pass; the non-test code also compiles with `#![no_std]` active.
-* `host`: 4 tests pass (offline pipeline on synthetic Electra-era data, tamper, wrong root,
-  Gloas refusal); the CLI was run end-to-end (exit codes checked); the header root was
-  cross-checked against an independent Python/hashlib computation.
 
