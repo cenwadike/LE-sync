@@ -1,0 +1,31 @@
+[package]
+name = "le-sync-vectors"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Runs consensus-spec-tests light_client/sync vectors against le-sync-core"
+
+[lib]
+name = "le_sync_vectors"
+
+[[bin]]
+name = "run-vectors"
+path = "src/main.rs"
+
+[dependencies]
+le-sync-core = { path = "../core" }
+snap = "1"
+serde_yaml = "0.9"
+# Native reference BLS (crates.io blst). Optional: the risc0 fork of `blst` pulled in by
+# `bls-blst-guest` also sets `links = "blst"`, so the two cannot be in one build.
+blst = { version = "0.3", optional = true }
+# Guest BLS impls (`wire/src/bls.rs`), run natively against the spec vectors.
+le-sync-wire = { path = "../wire", default-features = false, optional = true }
+
+[features]
+default = ["native-blst"]
+native-blst = ["dep:blst"]
+# cargo run -p le-sync-vectors --release --features bls-zk -- <dir> minimal
+bls-zk = ["dep:le-sync-wire", "le-sync-wire/bls-zk"]
+# cargo run -p le-sync-vectors --release --no-default-features --features bls-blst-guest -- <dir> minimal
+bls-blst-guest = ["dep:le-sync-wire", "le-sync-wire/bls-blst"]

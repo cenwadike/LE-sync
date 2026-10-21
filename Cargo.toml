@@ -1,5 +1,6 @@
 [workspace]
-members = ["core", "host"]
+members = ["core", "wire", "host", "vectors"]
+exclude = ["guest"]
 resolver = "2"
 
 [workspace.package]

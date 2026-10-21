@@ -1,6 +1,6 @@
 //! `le-sync-core`: `no_std`, allocation-free Ethereum light-client primitives.
 //!
-//! Scope (Sprint 1): SSZ Merkle-branch verification as the consensus specs define it,
+//! Scope (Sprint 1+2): SSZ Merkle-branch verification as the consensus specs define it,
 //! with the light-client generalized indices selected per fork.
 //!
 //! Spec map (all from `ethereum/consensus-specs`):
@@ -12,17 +12,13 @@
 //!   `*_gindex_at_slot` helpers that switch on `ELECTRA_FORK_EPOCH`
 //! * Fulu: `BeaconState` only gains `proposer_lookahead` as its last field (38 fields, still
 //!   padded to 64 leaves) so every light-client gindex is unchanged. Light-client data for
-//!   Electra..=Fulu uses the Electra SSZ types (see Gloas LC networking spec).
-//! * Gloas changes the gindices (`*_GINDEX_GLOAS`). They are NOT implemented here, so
-//!   slots at/after the Gloas fork epoch are rejected (fail closed), never verified with
-//!   the wrong depth.
-//!
-//! Not covered yet (Sprint 2+): BLS aggregate check, period/relevance asserts,
-//! weak-subjectivity period, `Capella+` execution-branch checks.
+//!   Electra..=Fulu uses the Electra SSZ types.
 
 #![cfg_attr(not(test), no_std)]
 
 use sha2::{Digest, Sha256};
+
+pub mod sync;
 
 pub type Bytes32 = [u8; 32];
 pub type BlsPubkey = [u8; 48];
@@ -35,7 +31,7 @@ pub const MAX_SYNC_COMMITTEE_SIZE: usize = 512;
 pub const FINALIZED_ROOT_GINDEX: u64 = 105;
 pub const CURRENT_SYNC_COMMITTEE_GINDEX: u64 = 54;
 pub const NEXT_SYNC_COMMITTEE_GINDEX: u64 = 55;
-// Electra sync-protocol "New constants". Unchanged by Fulu.
+
 pub const FINALIZED_ROOT_GINDEX_ELECTRA: u64 = 169;
 pub const CURRENT_SYNC_COMMITTEE_GINDEX_ELECTRA: u64 = 86;
 pub const NEXT_SYNC_COMMITTEE_GINDEX_ELECTRA: u64 = 87;
@@ -54,9 +50,18 @@ pub enum Error {
     BadSyncCommitteeSize,
     /// Finalized header at genesis slot must be the empty header.
     GenesisFinalizedHeaderNotEmpty,
+    CommitteeSizeMismatch,
+    InsufficientParticipants,
+    BadSlotOrder,
+    PeriodSkipped,
+    UpdateNotRelevant,
+    FinalizedHeaderNotEmpty,
+    NextCommitteeNotEmpty,
+    NextCommitteeMismatch,
+    BadSignature,
 }
 
-fn hash_pair(a: &Bytes32, b: &Bytes32) -> Bytes32 {
+pub fn hash_pair(a: &Bytes32, b: &Bytes32) -> Bytes32 {
     let mut h = Sha256::new();
     h.update(a);
     h.update(b);
@@ -307,6 +312,8 @@ pub fn verify_finality_branch(
     }
 }
 
+// ---- BLS signature verification ------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,12 +378,6 @@ mod tests {
         }
         assert_eq!(FINALIZED_ROOT_GINDEX, 105);
         assert_eq!(FINALIZED_ROOT_GINDEX_ELECTRA, 169);
-        // depth / subtree index used by the verifier
-        assert_eq!((floorlog2(169), get_subtree_index(169)), (7, 41));
-        assert_eq!((floorlog2(86), get_subtree_index(86)), (6, 22));
-        assert_eq!((floorlog2(87), get_subtree_index(87)), (6, 23));
-        assert_eq!((floorlog2(105), get_subtree_index(105)), (6, 41));
-        assert_eq!((floorlog2(54), get_subtree_index(54)), (5, 22));
     }
 
     // ---- merkle branch ---------------------------------------------------------------------
@@ -389,21 +390,57 @@ mod tests {
             for index in [0usize, 1, 22, 41 % (1 << depth)] {
                 let leaf = levels[0][index];
                 let branch = branch_for(&levels, index);
-                assert!(is_valid_merkle_branch(&leaf, &branch, depth, index as u64, &root));
+                assert!(is_valid_merkle_branch(
+                    &leaf,
+                    &branch,
+                    depth,
+                    index as u64,
+                    &root
+                ));
                 // wrong index / wrong leaf / wrong root
-                assert!(!is_valid_merkle_branch(&leaf, &branch, depth, (index ^ 1) as u64, &root));
-                assert!(!is_valid_merkle_branch(&leaf_n(999), &branch, depth, index as u64, &root));
-                assert!(!is_valid_merkle_branch(&leaf, &branch, depth, index as u64, &leaf_n(7)));
+                assert!(!is_valid_merkle_branch(
+                    &leaf,
+                    &branch,
+                    depth,
+                    (index ^ 1) as u64,
+                    &root
+                ));
+                assert!(!is_valid_merkle_branch(
+                    &leaf_n(999),
+                    &branch,
+                    depth,
+                    index as u64,
+                    &root
+                ));
+                assert!(!is_valid_merkle_branch(
+                    &leaf,
+                    &branch,
+                    depth,
+                    index as u64,
+                    &leaf_n(7)
+                ));
                 // flip each bit-0 of every byte of every node
                 for n in 0..branch.len() {
                     for b in 0..32 {
                         let mut bad = branch.clone();
                         bad[n][b] ^= 1;
-                        assert!(!is_valid_merkle_branch(&leaf, &bad, depth, index as u64, &root));
+                        assert!(!is_valid_merkle_branch(
+                            &leaf,
+                            &bad,
+                            depth,
+                            index as u64,
+                            &root
+                        ));
                     }
                 }
                 // short branch is rejected, not a panic
-                assert!(!is_valid_merkle_branch(&leaf, &branch[1..], depth, index as u64, &root));
+                assert!(!is_valid_merkle_branch(
+                    &leaf,
+                    &branch[1..],
+                    depth,
+                    index as u64,
+                    &root
+                ));
             }
         }
     }
@@ -414,14 +451,34 @@ mod tests {
         let root = levels.last().unwrap()[0];
         let leaf = levels[0][41];
         let b6 = branch_for(&levels, 41);
-        assert!(is_valid_normalized_merkle_branch(&leaf, &b6, FINALIZED_ROOT_GINDEX, &root));
+        assert!(is_valid_normalized_merkle_branch(
+            &leaf,
+            &b6,
+            FINALIZED_ROOT_GINDEX,
+            &root
+        ));
         let mut b7 = vec![ZERO];
         b7.extend_from_slice(&b6);
-        assert!(is_valid_normalized_merkle_branch(&leaf, &b7, FINALIZED_ROOT_GINDEX, &root));
+        assert!(is_valid_normalized_merkle_branch(
+            &leaf,
+            &b7,
+            FINALIZED_ROOT_GINDEX,
+            &root
+        ));
         b7[0] = leaf_n(1);
-        assert!(!is_valid_normalized_merkle_branch(&leaf, &b7, FINALIZED_ROOT_GINDEX, &root));
+        assert!(!is_valid_normalized_merkle_branch(
+            &leaf,
+            &b7,
+            FINALIZED_ROOT_GINDEX,
+            &root
+        ));
         // too short for the gindex
-        assert!(!is_valid_normalized_merkle_branch(&leaf, &b6, FINALIZED_ROOT_GINDEX_ELECTRA, &root));
+        assert!(!is_valid_normalized_merkle_branch(
+            &leaf,
+            &b6,
+            FINALIZED_ROOT_GINDEX_ELECTRA,
+            &root
+        ));
     }
 
     // ---- header / committee roots (structure checks vs a recursive merkleizer) ------------
@@ -431,7 +488,10 @@ mod tests {
             return chunks[0];
         }
         let h = chunks.len() / 2;
-        hash_pair(&merkleize_recursive(&chunks[..h]), &merkleize_recursive(&chunks[h..]))
+        hash_pair(
+            &merkleize_recursive(&chunks[..h]),
+            &merkleize_recursive(&chunks[h..]),
+        )
     }
 
     #[test]
@@ -454,7 +514,10 @@ mod tests {
             ZERO,
         ];
         assert_eq!(h.hash_tree_root(), merkleize_recursive(&chunks));
-        assert_ne!(h.hash_tree_root(), BeaconBlockHeader::default().hash_tree_root());
+        assert_ne!(
+            h.hash_tree_root(),
+            BeaconBlockHeader::default().hash_tree_root()
+        );
     }
 
     fn pk(i: u64) -> BlsPubkey {
@@ -474,8 +537,14 @@ mod tests {
         let roots: Vec<Bytes32> = pks.iter().map(pubkey_root).collect();
         let want = hash_pair(&merkleize_recursive(&roots), &pubkey_root(&agg));
         assert_eq!(sync_committee_root(&pks, &agg).unwrap(), want);
-        assert_eq!(sync_committee_root(&pks[..100], &agg), Err(Error::BadSyncCommitteeSize));
-        assert_eq!(sync_committee_root(&[], &agg), Err(Error::BadSyncCommitteeSize));
+        assert_eq!(
+            sync_committee_root(&pks[..100], &agg),
+            Err(Error::BadSyncCommitteeSize)
+        );
+        assert_eq!(
+            sync_committee_root(&[], &agg),
+            Err(Error::BadSyncCommitteeSize)
+        );
     }
 
     // ---- fork selection ---------------------------------------------------------------------
@@ -488,17 +557,29 @@ mod tests {
 
     #[test]
     fn gindices_switch_at_electra_and_fail_closed_at_gloas() {
-        assert_eq!(CFG.gindices_at_slot(10 * 32 - 1).unwrap().finalized_root, 105);
+        assert_eq!(
+            CFG.gindices_at_slot(10 * 32 - 1).unwrap().finalized_root,
+            105
+        );
         assert_eq!(CFG.gindices_at_slot(10 * 32).unwrap().finalized_root, 169);
-        assert_eq!(CFG.gindices_at_slot(100 * 32 - 1).unwrap().finalized_root, 169);
+        assert_eq!(
+            CFG.gindices_at_slot(100 * 32 - 1).unwrap().finalized_root,
+            169
+        );
         assert_eq!(CFG.gindices_at_slot(100 * 32), Err(Error::UnsupportedFork));
-        let bad = ChainConfig { slots_per_epoch: 0, ..CFG };
+        let bad = ChainConfig {
+            slots_per_epoch: 0,
+            ..CFG
+        };
         assert_eq!(bad.gindices_at_slot(1), Err(Error::BadConfig));
     }
 
     // ---- finality branch: synthetic BeaconState-shaped trees --------------------------------
 
-    fn finality_fixture(attested_slot: u64, depth: u32) -> (BeaconBlockHeader, BeaconBlockHeader, Vec<Bytes32>) {
+    fn finality_fixture(
+        attested_slot: u64,
+        depth: u32,
+    ) -> (BeaconBlockHeader, BeaconBlockHeader, Vec<Bytes32>) {
         let finalized = BeaconBlockHeader {
             slot: attested_slot - 64,
             proposer_index: 7,
@@ -538,15 +619,24 @@ mod tests {
             for b in 0..32 {
                 let mut bad = br.clone();
                 bad[n][b] ^= 0x01;
-                assert_eq!(verify_finality_branch(&CFG, &att, &fin, &bad), Err(Error::InvalidBranch));
+                assert_eq!(
+                    verify_finality_branch(&CFG, &att, &fin, &bad),
+                    Err(Error::InvalidBranch)
+                );
             }
         }
         let mut f2 = fin;
         f2.slot += 1; // different finalized header => different leaf
-        assert_eq!(verify_finality_branch(&CFG, &att, &f2, &br), Err(Error::InvalidBranch));
+        assert_eq!(
+            verify_finality_branch(&CFG, &att, &f2, &br),
+            Err(Error::InvalidBranch)
+        );
         let mut a2 = att;
         a2.state_root[0] ^= 1;
-        assert_eq!(verify_finality_branch(&CFG, &a2, &fin, &br), Err(Error::InvalidBranch));
+        assert_eq!(
+            verify_finality_branch(&CFG, &a2, &fin, &br),
+            Err(Error::InvalidBranch)
+        );
     }
 
     #[test]
@@ -554,15 +644,24 @@ mod tests {
         // Electra branch (7) presented for a pre-Electra slot: leading node non-zero => reject
         let (mut att, fin, br) = finality_fixture(20 * 32, 7);
         att.slot = 5 * 32;
-        assert_eq!(verify_finality_branch(&CFG, &att, &fin, &br), Err(Error::InvalidBranch));
+        assert_eq!(
+            verify_finality_branch(&CFG, &att, &fin, &br),
+            Err(Error::InvalidBranch)
+        );
         // Pre-Electra branch (6) presented for an Electra slot: too short => reject
         let (mut att6, fin6, br6) = finality_fixture(5 * 32, 6);
         att6.slot = 20 * 32;
-        assert_eq!(verify_finality_branch(&CFG, &att6, &fin6, &br6), Err(Error::InvalidBranch));
+        assert_eq!(
+            verify_finality_branch(&CFG, &att6, &fin6, &br6),
+            Err(Error::InvalidBranch)
+        );
         // Gloas slot: refuse rather than guess a depth
         let (mut att, fin, br) = finality_fixture(20 * 32, 7);
         att.slot = 100 * 32;
-        assert_eq!(verify_finality_branch(&CFG, &att, &fin, &br), Err(Error::UnsupportedFork));
+        assert_eq!(
+            verify_finality_branch(&CFG, &att, &fin, &br),
+            Err(Error::UnsupportedFork)
+        );
     }
 
     #[test]
@@ -571,10 +670,21 @@ mod tests {
         let mut leaves: Vec<Bytes32> = (0..128u64).map(leaf_n).collect();
         leaves[41] = ZERO;
         let levels = build_levels(&leaves);
-        let att = BeaconBlockHeader { slot: 20 * 32, state_root: levels.last().unwrap()[0], ..Default::default() };
+        let att = BeaconBlockHeader {
+            slot: 20 * 32,
+            state_root: levels.last().unwrap()[0],
+            ..Default::default()
+        };
         let br = branch_for(&levels, 41);
-        assert_eq!(verify_finality_branch(&CFG, &att, &BeaconBlockHeader::default(), &br), Ok(()));
-        let nonempty = BeaconBlockHeader { slot: 0, proposer_index: 1, ..Default::default() };
+        assert_eq!(
+            verify_finality_branch(&CFG, &att, &BeaconBlockHeader::default(), &br),
+            Ok(())
+        );
+        let nonempty = BeaconBlockHeader {
+            slot: 0,
+            proposer_index: 1,
+            ..Default::default()
+        };
         assert_eq!(
             verify_finality_branch(&CFG, &att, &nonempty, &br),
             Err(Error::GenesisFinalizedHeaderNotEmpty)
@@ -583,7 +693,11 @@ mod tests {
 
     // ---- bootstrap ------------------------------------------------------------------------------
 
-    fn bootstrap_fixture(slot: u64, depth: u32, gindex_index: usize) -> (BeaconBlockHeader, Vec<BlsPubkey>, BlsPubkey, Vec<Bytes32>) {
+    fn bootstrap_fixture(
+        slot: u64,
+        depth: u32,
+        gindex_index: usize,
+    ) -> (BeaconBlockHeader, Vec<BlsPubkey>, BlsPubkey, Vec<Bytes32>) {
         let (pks, agg) = committee(512);
         let mut leaves: Vec<Bytes32> = (0..(1u64 << depth)).map(leaf_n).collect();
         leaves[gindex_index] = sync_committee_root(&pks, &agg).unwrap();
@@ -606,21 +720,36 @@ mod tests {
         assert_eq!(verify_bootstrap(&CFG, &root, &h, &pks, &agg, &br), Ok(()));
         // pre-Electra: gindex 54 => depth 5, index 22
         let (h5, pks5, agg5, br5) = bootstrap_fixture(5 * 32, 5, 22);
-        assert_eq!(verify_bootstrap(&CFG, &h5.hash_tree_root(), &h5, &pks5, &agg5, &br5), Ok(()));
+        assert_eq!(
+            verify_bootstrap(&CFG, &h5.hash_tree_root(), &h5, &pks5, &agg5, &br5),
+            Ok(())
+        );
 
         // wrong trusted root
-        assert_eq!(verify_bootstrap(&CFG, &leaf_n(1), &h, &pks, &agg, &br), Err(Error::TrustedRootMismatch));
+        assert_eq!(
+            verify_bootstrap(&CFG, &leaf_n(1), &h, &pks, &agg, &br),
+            Err(Error::TrustedRootMismatch)
+        );
         // tampered pubkey / aggregate / branch node
         let mut p2 = pks.clone();
         p2[300][47] ^= 1;
-        assert_eq!(verify_bootstrap(&CFG, &root, &h, &p2, &agg, &br), Err(Error::InvalidBranch));
+        assert_eq!(
+            verify_bootstrap(&CFG, &root, &h, &p2, &agg, &br),
+            Err(Error::InvalidBranch)
+        );
         let mut a2 = agg;
         a2[0] ^= 1;
-        assert_eq!(verify_bootstrap(&CFG, &root, &h, &pks, &a2, &br), Err(Error::InvalidBranch));
+        assert_eq!(
+            verify_bootstrap(&CFG, &root, &h, &pks, &a2, &br),
+            Err(Error::InvalidBranch)
+        );
         for n in 0..br.len() {
             let mut bad = br.clone();
             bad[n][31] ^= 1;
-            assert_eq!(verify_bootstrap(&CFG, &root, &h, &pks, &agg, &bad), Err(Error::InvalidBranch));
+            assert_eq!(
+                verify_bootstrap(&CFG, &root, &h, &pks, &agg, &bad),
+                Err(Error::InvalidBranch)
+            );
         }
     }
 }

@@ -1,0 +1,39 @@
+[package]
+name = "le-sync-wire"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Host<->guest wire types + the pure verification routine run inside the zkVM guest"
+
+[dependencies]
+le-sync-core = { path = "../core" }
+serde = { version = "1", default-features = false, features = [
+    "derive",
+    "alloc",
+], optional = true }
+
+# BLS candidates (pick ONE in the guest). Tags are from the risc0 acceleration docs page.
+# A: risc0-accelerated zkcrypto bls12_381 (we write FastAggregateVerify ourselves on top of it)
+bls12_381 = { git = "https://github.com/risc0/zkcrypto-bls12_381", tag = "bls12_381/v0.8.0-risczero.1", default-features = false, features = [
+    "groups",
+    "pairings",
+    "alloc",
+    "experimental",
+], optional = true }
+sha2_09 = { package = "sha2", version = "0.9.9", default-features = false, optional = true }
+# B: risc0-patched blst (same API the native vectors runner already uses)
+blst = { git = "https://github.com/risc0/blst", tag = "blst/v0.3.14-risczero.0", optional = true }
+# Guest-only: per-phase cycle counters for `cycle-trace`.
+risc0-zkvm = { version = "=3.0.5", default-features = false, optional = true }
+
+[features]
+default = ["serde"]
+bls-zk = ["dep:bls12_381", "dep:sha2_09"]
+bls-blst = ["dep:blst"]
+# Guest logs a per-phase cycle breakdown of each aggregate verify.
+cycle-trace = ["dep:risc0-zkvm"]
+# Skip the per-key subgroup check on committee pubkeys (see src/bls.rs for the trade-off).
+unchecked-pubkeys = []
+
+[dev-dependencies]
+sha2 = { version = "0.10", default-features = false }
