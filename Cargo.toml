@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT AND Apache-2.0"
 
 # Real pairings in a debug build are very slow, and cargo-mutants derives its test timeout
 # from the baseline run. Optimise the heavy crypto crates even in dev/test profiles.

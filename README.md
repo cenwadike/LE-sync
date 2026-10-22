@@ -1,4 +1,4 @@
-# le-sync — Ethereum light-client verifier for LEZ (RFP-021 PoC)
+# le-sync: Logos-Ethereum Synchronizer (RFP-021 PoC)
 
 `core` (`no_std`, no alloc) implements the Altair→Fulu light-client sync protocol; `wire` wraps it
 for the RISC Zero guest; `host` fetches beacon-API data and runs the guest; `vectors` replays the
