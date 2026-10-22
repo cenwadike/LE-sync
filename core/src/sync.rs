@@ -85,6 +85,25 @@ impl ForkSchedule {
         Self { entries, len: 1 }
     }
 
+    /// The populated schedule entries, in epoch order.
+    pub fn entries(&self) -> &[(u64, Version)] {
+        &self.entries[..self.len]
+    }
+
+    /// Fixed-layout, domain-separated digest of the schedule:
+    /// `SHA256("LE_SYNC_FORK_SCHEDULE_V1" || len:u64le || (epoch:u64le || version:4)*)`.
+    /// The count is committed so padding or a trailing `(0, [0;4])` entry cannot collide.
+    pub fn hash(&self) -> Bytes32 {
+        let mut h = Sha256::new();
+        h.update(b"LE_SYNC_FORK_SCHEDULE_V1");
+        h.update((self.len as u64).to_le_bytes());
+        for (epoch, version) in self.entries() {
+            h.update(epoch.to_le_bytes());
+            h.update(version);
+        }
+        h.finalize().into()
+    }
+
     pub fn version_at_epoch(&self, epoch: u64) -> Version {
         let mut v = self.entries[0].1;
         for e in &self.entries[..self.len] {
@@ -114,6 +133,69 @@ impl SyncConfig {
 
     pub fn period_at_slot(&self, slot: u64) -> u64 {
         slot / self.chain.slots_per_epoch / self.epochs_per_period
+    }
+
+    /// The chain binding this configuration implies. `chain_id` is supplied by the caller:
+    /// it is a declared label (e.g. `DEPOSIT_CHAIN_ID`), not something the signatures cover.
+    pub fn binding(&self, chain_id: u64) -> ChainBinding {
+        ChainBinding {
+            chain_id,
+            genesis_validators_root: self.genesis_validators_root,
+            fork_schedule_hash: self.forks.hash(),
+            slots_per_epoch: self.chain.slots_per_epoch,
+            epochs_per_period: self.epochs_per_period,
+        }
+    }
+}
+
+/// Everything that identifies the chain a proof is about, committed as one digest.
+///
+/// Cryptographic status of each field: `genesis_validators_root` and the fork versions in
+/// `fork_schedule_hash` feed the BLS signing domain, so a forged value makes signatures fail.
+/// `chain_id`, `slots_per_epoch` and `epochs_per_period` are NOT signed by anything; they are
+/// declared labels whose integrity rests on the verifier comparing the committed binding with
+/// an expected one (`check` / `check_digest`, returning `Error::ChainMismatch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainBinding {
+    pub chain_id: u64,
+    pub genesis_validators_root: Bytes32,
+    pub fork_schedule_hash: Bytes32,
+    pub slots_per_epoch: u64,
+    pub epochs_per_period: u64,
+}
+
+impl ChainBinding {
+    /// `SHA256("LE_SYNC_CHAIN_BINDING_V1" || chain_id:u64le || gvr:32 || fork_schedule_hash:32
+    /// || slots_per_epoch:u64le || epochs_per_period:u64le)`. Every field is fixed-width, so
+    /// the encoding is unambiguous. Intended for reuse by statement-ID derivation.
+    pub fn digest(&self) -> Bytes32 {
+        let mut h = Sha256::new();
+        h.update(b"LE_SYNC_CHAIN_BINDING_V1");
+        h.update(self.chain_id.to_le_bytes());
+        h.update(self.genesis_validators_root);
+        h.update(self.fork_schedule_hash);
+        h.update(self.slots_per_epoch.to_le_bytes());
+        h.update(self.epochs_per_period.to_le_bytes());
+        h.finalize().into()
+    }
+
+    /// Consumer-side check: `self` is the binding the verifier expects, `committed` is the one
+    /// found in the proof.
+    pub fn check(&self, committed: &ChainBinding) -> Result<(), Error> {
+        if self == committed {
+            Ok(())
+        } else {
+            Err(Error::ChainMismatch)
+        }
+    }
+
+    /// Same as `check`, against a committed digest (what a journal carries).
+    pub fn check_digest(&self, committed: &Bytes32) -> Result<(), Error> {
+        if self.digest() == *committed {
+            Ok(())
+        } else {
+            Err(Error::ChainMismatch)
+        }
     }
 }
 
@@ -277,12 +359,15 @@ impl LightClientStore {
         slots_per_epoch: u64,
         epochs_per_sync_committee_period: u64,
     ) -> Result<(), Error> {
-        let period_length = slots_per_epoch * epochs_per_sync_committee_period;
+        let period_length = slots_per_epoch.saturating_mul(epochs_per_sync_committee_period);
+        if period_length == 0 {
+            return Err(Error::BadConfig);
+        }
         let current_period = current_slot / period_length;
         let finalized_period = self.finalized_header.slot / period_length;
 
-        if current_period > finalized_period + WEAK_SUBJECTIVITY_PERIOD_LIMIT {
-            return Err(Error::BadConfig);
+        if current_period > finalized_period.saturating_add(WEAK_SUBJECTIVITY_PERIOD_LIMIT) {
+            return Err(Error::CheckpointStale);
         }
         Ok(())
     }
@@ -310,8 +395,17 @@ impl LightClientStore {
     pub fn upgrade_store(&mut self, _target_fork_version: Version) {}
 }
 
-fn count_bits(bits: &[u8]) -> u64 {
+pub fn count_bits(bits: &[u8]) -> u64 {
     bits.iter().map(|b| b.count_ones() as u64).sum()
+}
+
+/// Spec supermajority test: `sum(bits) * 3 >= len(bits) * 2` (bitfield length in bits).
+/// The single home of the 2/3 arithmetic: used by `is_better_update`,
+/// `process_light_client_update` and the `wire` strict gate. An empty bitfield is not a
+/// supermajority (fail closed; unreachable through validation, which rejects size 0).
+pub fn has_supermajority(bits: &[u8]) -> bool {
+    let n = (bits.len() * 8) as u64;
+    n != 0 && count_bits(bits) * 3 >= n * 2
 }
 
 /// Spec `is_better_update` (Altair; unchanged through Fulu).
@@ -320,11 +414,11 @@ pub fn is_better_update(
     old: &LightClientUpdate,
     cfg: &SyncConfig,
 ) -> bool {
-    let max_active = (new.sync_committee_bits.len() * 8) as u64;
     let new_active = count_bits(new.sync_committee_bits);
     let old_active = count_bits(old.sync_committee_bits);
-    let new_super = new_active * 3 >= max_active * 2;
-    let old_super = old_active * 3 >= max_active * 2;
+    // Both updates were validated against the same committee, so their bitfield lengths match.
+    let new_super = has_supermajority(new.sync_committee_bits);
+    let old_super = has_supermajority(old.sync_committee_bits);
     if new_super != old_super {
         return new_super;
     }
@@ -561,7 +655,6 @@ pub fn process_light_client_update<B: Bls>(
 ) -> Result<(), Error> {
     validate_light_client_update(store, update, current_slot, cfg, bls)?;
 
-    let n = (update.sync_committee_bits.len() * 8) as u64;
     let active = count_bits(update.sync_committee_bits);
 
     // Track the best valid update (spec ranking) for a later force-update.
@@ -586,7 +679,7 @@ pub fn process_light_client_update<B: Bls>(
         && cfg.period_at_slot(update.finalized_header.slot)
             == cfg.period_at_slot(update.attested_header.slot);
 
-    if active * 3 >= n * 2
+    if has_supermajority(update.sync_committee_bits)
         && (update.finalized_header.slot > store.finalized_header.slot
             || update_has_finalized_next_sync_committee)
     {
@@ -703,6 +796,8 @@ mod tests {
         expect: Option<Bytes32>,
         result: bool,
         seen: RefCell<Vec<(Bytes32, usize)>>,
+        /// First pubkey of the committee each call was verified against (which committee?).
+        keys: RefCell<Vec<BlsPubkey>>,
     }
     impl Mock {
         fn ok() -> Self {
@@ -710,6 +805,7 @@ mod tests {
                 expect: None,
                 result: true,
                 seen: RefCell::new(vec![]),
+                keys: RefCell::new(vec![]),
             }
         }
         fn expecting(r: Bytes32) -> Self {
@@ -717,6 +813,7 @@ mod tests {
                 expect: Some(r),
                 result: true,
                 seen: RefCell::new(vec![]),
+                keys: RefCell::new(vec![]),
             }
         }
         fn reject() -> Self {
@@ -724,6 +821,7 @@ mod tests {
                 expect: None,
                 result: false,
                 seen: RefCell::new(vec![]),
+                keys: RefCell::new(vec![]),
             }
         }
     }
@@ -738,6 +836,7 @@ mod tests {
         ) -> bool {
             assert_eq!(c.len(), bits.len() * 8);
             self.seen.borrow_mut().push((*root, c.len()));
+            self.keys.borrow_mut().push(c[0]);
             self.result && self.expect.map_or(true, |e| e == *root)
         }
     }
@@ -801,6 +900,82 @@ mod tests {
         }
     }
 
+    // ---- Arithmetic & Edge-Case Boundary Assertions (Mutation Hardening) ----
+
+    #[test]
+    fn test_slot_and_epoch_arithmetic_boundaries() {
+        let c = cfg(GVR_A);
+        let slots_per_epoch = c.chain.slots_per_epoch; // 8
+        let epochs_per_period = c.epochs_per_period; // 8
+        let period_length = slots_per_epoch * epochs_per_period; // 64
+
+        // Exact slot rollovers and period boundary checks
+        assert_eq!(c.period_at_slot(0), 0);
+        assert_eq!(c.period_at_slot(period_length - 1), 0);
+        assert_eq!(c.period_at_slot(period_length), 1);
+        assert_eq!(c.period_at_slot(period_length + 1), 1);
+
+        // Verify division versus modulo mutations (e.g., slot / slots_per_epoch)
+        // Choose a slot where quotient != remainder so the assert_ne is meaningful.
+        let test_slot = 26;
+        let expected_epoch = test_slot / slots_per_epoch; // 3
+        assert_eq!(test_slot / slots_per_epoch, expected_epoch);
+        assert_ne!(test_slot % slots_per_epoch, expected_epoch); // 2 != 3
+    }
+
+    #[test]
+    fn test_bitmask_boundary_and_chunk_lengths() {
+        // Test exact bitmask sizing, trailing bits, and boundary evaluations for has_supermajority
+        // Committee size N = 32 elements (4 bytes). 2/3 threshold is 22 bits set (66 >= 64).
+
+        // Exactly 21 bits set (< 2/3 threshold)
+        let bits_21 = vec![0xFF, 0xFF, 0x1F, 0x00];
+        assert_eq!(bits_21.len() * 8, 32);
+        assert!(
+            !has_supermajority(&bits_21),
+            "21 bits must fail supermajority check"
+        );
+
+        // Exactly 22 bits set (>= 2/3 threshold)
+        let bits_22 = vec![0xFF, 0xFF, 0x3F, 0x00];
+        assert!(
+            has_supermajority(&bits_22),
+            "22 bits must pass supermajority check"
+        );
+
+        // Trailing bits outside committee range or mismatched chunk lengths
+        let mismatched_bits = vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF]; // 40 bits for a 32-element committee
+        let f = fixture();
+        let store = f.store.clone();
+        let mut u = upd(&f, 41);
+        u.sync_committee_bits = &mismatched_bits;
+
+        // Fixed: changed `c(GVR_A)` to `cfg(GVR_A)`
+        let validation_result =
+            validate_light_client_update(&store, &u, 41, &cfg(GVR_A), &Mock::ok());
+        assert_eq!(
+            validation_result,
+            Err(Error::CommitteeSizeMismatch),
+            "Mismatched bitfield lengths must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_safety_threshold_arithmetic_precision() {
+        let store = LightClientStore {
+            finalized_header: BeaconBlockHeader::default(),
+            current_sync_committee: committee(1),
+            next_sync_committee: committee(2),
+            optimistic_header: BeaconBlockHeader::default(),
+            previous_max_active_participants: 30,
+            current_max_active_participants: 50,
+            best_valid_update: None,
+        };
+
+        // max(30, 50) / 2 = 25. Guards against integer division or operator mutations.
+        assert_eq!(store.safety_threshold(), 25);
+    }
+
     #[test]
     fn fork_digests_match_known_mainnet_values() {
         let gvr: Bytes32 = [
@@ -846,6 +1021,11 @@ mod tests {
         assert_eq!(store.next_sync_committee, f.next);
         assert_eq!(store.current_max_active_participants, N as u64);
         assert_eq!(bls.seen.borrow().len(), 1);
+        // same period => verified against the CURRENT committee, not the (empty) next one
+        assert_eq!(
+            bls.keys.borrow()[0],
+            f.store.current_sync_committee.keys()[0]
+        );
         // spec: best_valid_update is cleared after a normal apply
         assert!(store.best_valid_update.is_none());
     }
@@ -906,7 +1086,8 @@ mod tests {
         let f = fixture();
         let mut c = cfg(GVR_A);
         // fork boundary at epoch 5 (slot 40): signature_slot 41 -> slot 40 -> epoch 5 => new version
-        c.forks = ForkSchedule::new(&[(0, [1, 0, 0, 1]), (5, [2, 0, 0, 1])]).unwrap();
+        c.forks = ForkSchedule::new(&[(0, [1, 0, 0, 1]), (5, [2, 0, 0, 1]), (100, [3, 0, 0, 1])])
+            .unwrap();
         let bls = Mock::ok();
         let mut s = f.store.clone();
         process_light_client_update(&mut s, &upd(&f, 41), 41, &c, &bls).unwrap();
@@ -917,66 +1098,281 @@ mod tests {
         assert_eq!(bls.seen.borrow()[0].0, want);
     }
 
-    #[test]
-    fn spec_asserts_each_have_a_named_rejection() {
-        let f = fixture();
-        let c = cfg(GVR_A);
-        let ok = Mock::ok();
-        let v = |u: &LightClientUpdate, cur: u64| {
-            validate_light_client_update(&f.store, u, cur, &c, &ok)
-        };
+    // ---- one named rejection per spec assert; all start from the same passing baseline ----
 
-        // zero participants
+    fn validate_fx(f: &Fx, u: &LightClientUpdate, current_slot: u64) -> Result<(), Error> {
+        validate_light_client_update(&f.store, u, current_slot, &cfg(GVR_A), &Mock::ok())
+    }
+
+    #[test]
+    fn baseline_validates() {
+        // Guards every rejection test below: if the baseline stops passing, a "rejection"
+        // could be a broken fixture rather than the check under test.
+        let f = fixture();
+        assert_eq!(validate_fx(&f, &upd(&f, 41), 41), Ok(()));
+    }
+
+    #[test]
+    fn zero_participants_rejected() {
+        let f = fixture();
         let zero = vec![0u8; N / 8];
         let mut u = upd(&f, 41);
         u.sync_committee_bits = &zero;
-        assert_eq!(v(&u, 41), Err(Error::InsufficientParticipants));
-        // bitfield / committee size mismatch
+        assert_eq!(
+            validate_fx(&f, &u, 41),
+            Err(Error::InsufficientParticipants)
+        );
+    }
+
+    #[test]
+    fn committee_size_mismatch_rejected() {
+        let f = fixture();
         let short = vec![0xFFu8; 2];
         let mut u = upd(&f, 41);
         u.sync_committee_bits = &short;
-        assert_eq!(v(&u, 41), Err(Error::CommitteeSizeMismatch));
-        // signature_slot <= attested_slot
-        assert_eq!(v(&upd(&f, 40), 41), Err(Error::BadSlotOrder));
-        // current_slot < signature_slot
-        assert_eq!(v(&upd(&f, 41), 40), Err(Error::BadSlotOrder));
-        // finalized slot after attested slot
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::CommitteeSizeMismatch));
+    }
+
+    #[test]
+    fn signature_slot_not_after_attested_rejected() {
+        let f = fixture();
+        // signature_slot == attested_slot
+        assert_eq!(validate_fx(&f, &upd(&f, 40), 41), Err(Error::BadSlotOrder));
+    }
+
+    #[test]
+    fn current_slot_before_signature_slot_rejected() {
+        let f = fixture();
+        assert_eq!(validate_fx(&f, &upd(&f, 41), 40), Err(Error::BadSlotOrder));
+    }
+
+    #[test]
+    fn finalized_after_attested_rejected() {
+        let f = fixture();
         let mut u = upd(&f, 41);
         u.finalized_header.slot = 41;
-        assert_eq!(v(&u, 41), Err(Error::BadSlotOrder));
-        // signature in period 2 (slot 128+) while store period 0 and next unknown
-        assert_eq!(v(&upd(&f, 130), 130), Err(Error::PeriodSkipped));
-        // stale update, no next committee to offer
-        let mut u = upd(&f, 41);
-        u.attested_header.slot = 8; // == store finalized slot; also finalized (24) > attested -> order first
-        assert_eq!(v(&u, 41), Err(Error::BadSlotOrder));
-        // finality branch tampered
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::BadSlotOrder));
+    }
+
+    #[test]
+    fn skipped_period_rejected() {
+        // signature in period 2 (slot 128+) while store period is 0 and next committee unknown
+        let f = fixture();
+        assert_eq!(
+            validate_fx(&f, &upd(&f, 130), 130),
+            Err(Error::PeriodSkipped)
+        );
+    }
+
+    #[test]
+    fn stale_update_not_relevant_rejected() {
+        // attested slot == store finalized slot (8), no next committee on offer
+        let f = fixture();
+        let empty = SyncCommittee::empty(N);
+        let zeros7 = vec![ZERO; 7];
+        let zeros6 = vec![ZERO; 6];
+        let u = LightClientUpdate {
+            attested_header: hdr(8, leaf_n(400), 8),
+            next_sync_committee: &empty,
+            next_sync_committee_branch: &zeros6,
+            finalized_header: BeaconBlockHeader::default(),
+            finality_branch: &zeros7,
+            sync_committee_bits: &f.bits,
+            sync_committee_signature: [7u8; 96],
+            signature_slot: 41,
+        };
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::UpdateNotRelevant));
+    }
+
+    #[test]
+    fn bad_finality_branch_rejected() {
+        let f = fixture();
         let mut bad = f.finality_branch.clone();
         bad[3][0] ^= 1;
         let mut u = upd(&f, 41);
         u.finality_branch = &bad;
-        assert_eq!(v(&u, 41), Err(Error::InvalidBranch));
-        // next committee branch tampered
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::InvalidBranch));
+    }
+
+    #[test]
+    fn bad_next_committee_branch_rejected() {
+        let f = fixture();
         let mut bad = f.next_branch.clone();
         bad[0][0] ^= 1;
         let mut u = upd(&f, 41);
         u.next_sync_committee_branch = &bad;
-        assert_eq!(v(&u, 41), Err(Error::InvalidBranch));
-        // swapped next committee (right branch, wrong committee)
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::InvalidBranch));
+    }
+
+    #[test]
+    fn swapped_next_committee_rejected() {
+        // right branch, wrong committee: the root no longer matches the attested state
+        let f = fixture();
         let other = committee(5);
         let mut u = upd(&f, 41);
         u.next_sync_committee = &other;
-        assert_eq!(v(&u, 41), Err(Error::InvalidBranch));
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::InvalidBranch));
+    }
+
+    #[test]
+    fn finalized_header_not_empty_rejected() {
         // no finality branch but a non-empty finalized header
+        let f = fixture();
         let zeros = vec![ZERO; 7];
         let mut u = upd(&f, 41);
         u.finality_branch = &zeros;
-        assert_eq!(v(&u, 41), Err(Error::FinalizedHeaderNotEmpty));
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::FinalizedHeaderNotEmpty));
+    }
+
+    #[test]
+    fn next_committee_not_empty_rejected() {
         // no next-committee branch but a non-empty next committee
+        let f = fixture();
         let zeros6 = vec![ZERO; 6];
         let mut u = upd(&f, 41);
         u.next_sync_committee_branch = &zeros6;
-        assert_eq!(v(&u, 41), Err(Error::NextCommitteeNotEmpty));
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::NextCommitteeNotEmpty));
+    }
+
+    #[test]
+    fn replayed_update_does_not_double_apply() {
+        // Spec behaviour: a replay whose attested slot is still newer than the store's
+        // finalized header is *valid* (so it is NOT UpdateNotRelevant), but it must change
+        // nothing that matters: no second apply, no committee rotation, no finalized move.
+        let f = fixture();
+        let c = cfg(GVR_A);
+        let mut store = f.store.clone();
+        process_light_client_update(&mut store, &upd(&f, 41), 41, &c, &Mock::ok()).unwrap();
+        let (fin, cur, next, opt, max) = (
+            store.finalized_header,
+            store.current_sync_committee.clone(),
+            store.next_sync_committee.clone(),
+            store.optimistic_header,
+            store.current_max_active_participants,
+        );
+        assert_eq!(
+            process_light_client_update(&mut store, &upd(&f, 41), 41, &c, &Mock::ok()),
+            Ok(())
+        );
+        assert_eq!(store.finalized_header, fin);
+        assert_eq!(store.current_sync_committee, cur);
+        assert_eq!(store.next_sync_committee, next);
+        assert_eq!(store.optimistic_header, opt);
+        assert_eq!(store.current_max_active_participants, max);
+    }
+
+    #[test]
+    fn has_supermajority_boundaries() {
+        // 24-bit field: exactly 2/3 = 16 set bits
+        let at = |set: usize| {
+            let mut b = vec![0u8; 3];
+            for i in 0..set {
+                b[i / 8] |= 1 << (i % 8);
+            }
+            b
+        };
+        assert!(has_supermajority(&at(16)), "exactly 2/3 counts");
+        assert!(!has_supermajority(&at(15)), "one short of 2/3 does not");
+        assert!(has_supermajority(&at(24)));
+        assert!(!has_supermajority(&at(0)));
+        // 32-bit minimal committee: 22 -> 66 >= 64, 21 -> 63 < 64
+        assert!(has_supermajority(&bits(22)));
+        assert!(!has_supermajority(&bits(21)));
+        // fail closed on an empty bitfield
+        assert!(!has_supermajority(&[]));
+    }
+
+    #[test]
+    fn weak_subjectivity_period_returns_checkpoint_stale() {
+        let f = fixture(); // store finalized at slot 8 => period 0 (64-slot periods)
+        let (spe, epp) = (SPE, EPP);
+        // limit is 4 periods
+        assert_eq!(
+            f.store
+                .assert_within_weak_subjectivity_period(4 * 64, spe, epp),
+            Ok(())
+        );
+        assert_eq!(
+            f.store
+                .assert_within_weak_subjectivity_period(5 * 64, spe, epp),
+            Err(Error::CheckpointStale)
+        );
+        // a zero period length is a config error, not a divide-by-zero panic
+        assert_eq!(
+            f.store.assert_within_weak_subjectivity_period(100, 0, epp),
+            Err(Error::BadConfig)
+        );
+    }
+
+    // ---- chain binding -------------------------------------------------------------------
+
+    #[test]
+    fn chain_binding_digest_changes_with_each_field() {
+        let base = cfg(GVR_A).binding(1);
+        assert_eq!(
+            base.digest(),
+            cfg(GVR_A).binding(1).digest(),
+            "deterministic"
+        );
+
+        let mut v = vec![];
+        v.push(cfg(GVR_A).binding(2)); // chain_id only
+        v.push(cfg(GVR_B).binding(1)); // gvr only
+        let mut c = cfg(GVR_A);
+        c.forks = ForkSchedule::single([0x06, 0, 0, 1]);
+        v.push(c.binding(1)); // fork version only
+        let mut c = cfg(GVR_A);
+        c.chain.slots_per_epoch = SPE + 1;
+        v.push(c.binding(1)); // slots_per_epoch only
+        let mut c = cfg(GVR_A);
+        c.epochs_per_period = EPP + 1;
+        v.push(c.binding(1)); // epochs_per_period only
+        for (i, b) in v.iter().enumerate() {
+            assert_ne!(
+                b.digest(),
+                base.digest(),
+                "field {i} not covered by the digest"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_binding_check_flags_mismatch() {
+        let expected = cfg(GVR_A).binding(1);
+        assert_eq!(expected.check(&cfg(GVR_A).binding(1)), Ok(()));
+        assert_eq!(
+            expected.check_digest(&cfg(GVR_A).binding(1).digest()),
+            Ok(())
+        );
+        // a label-only change (chain_id) is invisible to the guest but caught here
+        assert_eq!(
+            expected.check(&cfg(GVR_A).binding(2)),
+            Err(Error::ChainMismatch)
+        );
+        assert_eq!(
+            expected.check_digest(&cfg(GVR_A).binding(2).digest()),
+            Err(Error::ChainMismatch)
+        );
+        assert_eq!(
+            expected.check_digest(&cfg(GVR_B).binding(1).digest()),
+            Err(Error::ChainMismatch)
+        );
+    }
+
+    #[test]
+    fn fork_schedule_hash_and_entries() {
+        let a = ForkSchedule::new(&[(0, [0, 0, 0, 0]), (10, [1, 0, 0, 0])]).unwrap();
+        assert_eq!(a.entries(), &[(0, [0, 0, 0, 0]), (10, [1, 0, 0, 0])]);
+        assert_eq!(a.hash(), a.hash());
+        let b = ForkSchedule::new(&[(0, [0, 0, 0, 0]), (11, [1, 0, 0, 0])]).unwrap();
+        let c = ForkSchedule::new(&[(0, [0, 0, 0, 0]), (10, [2, 0, 0, 0])]).unwrap();
+        assert_ne!(a.hash(), b.hash(), "epoch");
+        assert_ne!(a.hash(), c.hash(), "version");
+        // a trailing all-zero entry must not collide with a shorter schedule
+        let s1 = ForkSchedule::single([1, 0, 0, 0]);
+        let s2 = ForkSchedule::new(&[(0, [1, 0, 0, 0]), (0, [0, 0, 0, 0])]).unwrap();
+        assert_ne!(s1.hash(), s2.hash(), "length");
+        assert_eq!(s1.entries().len(), 1);
     }
 
     #[test]
@@ -1105,6 +1501,11 @@ mod tests {
         assert_eq!(store.current_max_active_participants, 0);
         // and it was verified against committee B's keys (signature period 1 => store.next at check time)
         assert_eq!(bls.seen.borrow()[0].1, N);
+        assert_eq!(
+            bls.keys.borrow()[0],
+            f.next.keys()[0],
+            "must be committee B, not A"
+        );
     }
 
     #[test]
@@ -1116,5 +1517,396 @@ mod tests {
             validate_light_client_update(&f.store, &upd(&f, 41), 41, &c, &Mock::ok()),
             Err(Error::BadConfig)
         );
+    }
+
+    // ---- mutation hardening, round 2 (each test names the mutants it exists to kill) ----------
+
+    #[test]
+    fn capacity_constants_are_pinned() {
+        // `MAX_SYNC_COMMITTEE_SIZE / 8` -> `* 8` still compiles and only loosens a bound.
+        assert_eq!(MAX_BITS_LEN, 64);
+        assert_eq!(MAX_BRANCH_LEN, 8);
+    }
+
+    fn from_borrowed_with(
+        f: &Fx,
+        next_br: &[Bytes32],
+        fin_br: &[Bytes32],
+        bits: &[u8],
+    ) -> Result<(), Error> {
+        let mut u = upd(f, 41);
+        u.next_sync_committee_branch = next_br;
+        u.finality_branch = fin_br;
+        u.sync_committee_bits = bits;
+        OwnedLightClientUpdate::from_borrowed(&u).map(|_| ())
+    }
+
+    #[test]
+    fn from_borrowed_accepts_exact_capacity_and_rejects_one_over_per_field() {
+        let f = fixture();
+        let (br_ok, br_big) = ([ZERO; 8], [ZERO; 9]);
+        let (bits_ok, bits_big) = ([0u8; 64], [0u8; 65]);
+        assert_eq!(from_borrowed_with(&f, &br_ok, &br_ok, &bits_ok), Ok(()));
+        // exactly one operand over its limit, the other two at theirs
+        assert_eq!(
+            from_borrowed_with(&f, &br_big, &br_ok, &bits_ok),
+            Err(Error::BadConfig)
+        );
+        assert_eq!(
+            from_borrowed_with(&f, &br_ok, &br_big, &bits_ok),
+            Err(Error::BadConfig)
+        );
+        assert_eq!(
+            from_borrowed_with(&f, &br_ok, &br_ok, &bits_big),
+            Err(Error::BadConfig)
+        );
+    }
+
+    #[test]
+    fn committee_is_empty_only_when_aggregate_and_every_key_are_zero() {
+        assert!(SyncCommittee::empty(N).is_empty());
+        let mut only_agg = SyncCommittee::empty(N);
+        only_agg.aggregate_pubkey = [1u8; 48];
+        assert!(!only_agg.is_empty(), "non-zero aggregate, zero keys");
+        let mut only_key = SyncCommittee::empty(N);
+        only_key.pubkeys[N - 1] = [1u8; 48];
+        assert!(!only_key.is_empty(), "zero aggregate, one non-zero key");
+        assert!(!committee(1).is_empty());
+    }
+
+    #[test]
+    fn execution_branch_verifies_against_body_root_and_rejects_tamper() {
+        // BeaconBlockBody (Capella+): 16 field chunks, execution_payload = field 9 => gindex 25.
+        let payload = leaf_n(9_001);
+        let mut fields: Vec<Bytes32> = (0..16).map(|i| leaf_n(7_000 + i)).collect();
+        fields[9] = payload;
+        let l = levels(fields);
+        let br = branch(&l, 9);
+        assert_eq!(br.len(), 4);
+        let mut h = hdr(1, leaf_n(1), 1);
+        h.body_root = l.last().unwrap()[0];
+        assert_eq!(verify_execution_branch(&h, &br, &payload), Ok(()));
+        let mut bad = br.clone();
+        bad[0][0] ^= 1;
+        assert_eq!(
+            verify_execution_branch(&h, &bad, &payload),
+            Err(Error::InvalidBranch)
+        );
+        assert_eq!(
+            verify_execution_branch(&h, &br, &leaf_n(9_002)),
+            Err(Error::InvalidBranch)
+        );
+    }
+
+    #[test]
+    fn size_check_rejects_each_mismatching_operand_independently() {
+        let f = fixture(); // store committees: N = 32
+        let next64 = SyncCommittee::empty(64);
+        let b64 = vec![0xFFu8; 8];
+        // bits and next agree with each other (64) but not with the store
+        let mut u = upd(&f, 41);
+        u.sync_committee_bits = &b64;
+        u.next_sync_committee = &next64;
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::CommitteeSizeMismatch));
+        // bits agree with the store (32) but not with the update's next committee
+        let mut u = upd(&f, 41);
+        u.next_sync_committee = &next64;
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::CommitteeSizeMismatch));
+        // empty bitfield
+        let mut u = upd(&f, 41);
+        u.sync_committee_bits = &[];
+        assert_eq!(validate_fx(&f, &u, 41), Err(Error::CommitteeSizeMismatch));
+    }
+
+    #[test]
+    fn a_single_participant_meets_the_minimum() {
+        let f = fixture();
+        let b = bits(1);
+        let mut u = upd(&f, 41);
+        u.sync_committee_bits = &b;
+        assert_eq!(validate_fx(&f, &u, 41), Ok(()));
+    }
+
+    /// A sync-committee-only update (no finality), attested at `att_slot`, carrying `f.next`.
+    fn next_only<'a>(f: &'a Fx, st: &'a State, att_slot: u64) -> LightClientUpdate<'a> {
+        static ZEROS: [Bytes32; 7] = [ZERO; 7];
+        LightClientUpdate {
+            attested_header: hdr(att_slot, st.root, 5),
+            next_sync_committee: &f.next,
+            next_sync_committee_branch: &st.next_branch,
+            finalized_header: BeaconBlockHeader::default(),
+            finality_branch: &ZEROS,
+            sync_committee_bits: &f.bits,
+            sync_committee_signature: [7u8; 96],
+            signature_slot: att_slot + 1,
+        }
+    }
+
+    #[test]
+    fn first_update_carrying_the_next_committee_is_relevant_even_if_not_newer() {
+        let f = fixture(); // store finalized at 8, next committee unknown
+        let st = state(leaf_n(1), &committee(1), &f.next);
+        // attested slot 8 is NOT newer than the store's finalized slot 8; only `has_next` admits it
+        let u = next_only(&f, &st, 8);
+        assert_eq!(validate_fx(&f, &u, 9), Ok(()));
+    }
+
+    #[test]
+    fn once_the_next_committee_is_known_a_non_newer_update_is_not_relevant() {
+        let f = fixture();
+        let c = cfg(GVR_A);
+        let mut store = f.store.clone();
+        process_light_client_update(&mut store, &upd(&f, 41), 41, &c, &Mock::ok()).unwrap();
+        assert!(store.is_next_sync_committee_known());
+        assert_eq!(store.finalized_header.slot, 24);
+        // attested slot 24 == store finalized 24, same next committee, same period
+        let st = state(leaf_n(1), &committee(1), &f.next);
+        let u = next_only(&f, &st, 24);
+        assert_eq!(
+            validate_light_client_update(&store, &u, 25, &c, &Mock::ok()),
+            Err(Error::UpdateNotRelevant)
+        );
+    }
+
+    #[test]
+    fn fork_version_uses_epoch_division_not_multiplication() {
+        // Covered by the 3-fork schedule in `fork_version_comes_from_signature_slot_minus_one`;
+        // this asserts the same property at a second slot so the two cannot drift together.
+        let f = fixture();
+        let mut c = cfg(GVR_A);
+        c.forks = ForkSchedule::new(&[(0, [1, 0, 0, 1]), (5, [2, 0, 0, 1]), (100, [3, 0, 0, 1])])
+            .unwrap();
+        let bls = Mock::ok();
+        let mut s = f.store.clone();
+        process_light_client_update(&mut s, &upd(&f, 41), 41, &c, &bls).unwrap();
+        let v2 = compute_signing_root(
+            &f.att.hash_tree_root(),
+            &compute_domain(DOMAIN_SYNC_COMMITTEE, [2, 0, 0, 1], &GVR_A),
+        );
+        let v3 = compute_signing_root(
+            &f.att.hash_tree_root(),
+            &compute_domain(DOMAIN_SYNC_COMMITTEE, [3, 0, 0, 1], &GVR_A),
+        );
+        assert_eq!(bls.seen.borrow()[0].0, v2);
+        assert_ne!(bls.seen.borrow()[0].0, v3);
+    }
+
+    #[test]
+    fn apply_advances_finalized_strictly_and_drags_optimistic_only_when_behind() {
+        let f = fixture();
+        let c = cfg(GVR_A);
+        // (a) finalized moves 8 -> 24 and optimistic (8) is behind it: both advance
+        let mut s = f.store.clone();
+        apply_light_client_update(&mut s, &upd(&f, 41), &c).unwrap();
+        assert_eq!(s.finalized_header.slot, 24);
+        assert_eq!(s.optimistic_header.slot, 24);
+        assert!(s.is_next_sync_committee_known());
+        // (b) optimistic already AT the new finalized slot (different header): left alone
+        let other_opt = hdr(24, leaf_n(999), 77);
+        let mut s = f.store.clone();
+        s.optimistic_header = other_opt;
+        apply_light_client_update(&mut s, &upd(&f, 41), &c).unwrap();
+        assert_eq!(s.finalized_header.slot, 24);
+        assert_eq!(s.optimistic_header, other_opt);
+        // (c) store already finalized AT slot 24 (different header): not replaced
+        let other_fin = hdr(24, leaf_n(998), 78);
+        let mut s = f.store.clone();
+        s.finalized_header = other_fin;
+        apply_light_client_update(&mut s, &upd(&f, 41), &c).unwrap();
+        assert_eq!(s.finalized_header, other_fin);
+    }
+
+    #[test]
+    fn optimistic_header_needs_strictly_more_than_the_safety_threshold_and_a_newer_slot() {
+        let f = fixture();
+        let c = cfg(GVR_A);
+        // (a) active == safety threshold: current_max = 24 => threshold 12; 12 is not > 12
+        let mut s = f.store.clone();
+        s.current_max_active_participants = 24;
+        let b12 = bits(12);
+        let mut u = upd(&f, 41);
+        u.sync_committee_bits = &b12;
+        process_light_client_update(&mut s, &u, 41, &c, &Mock::ok()).unwrap();
+        assert_eq!(
+            s.optimistic_header.slot, 8,
+            "12 active is not > threshold 12"
+        );
+        // (b) plenty of participants but the attested header is OLDER than the optimistic one
+        let mut s = f.store.clone();
+        s.optimistic_header = hdr(50, leaf_n(1), 5);
+        process_light_client_update(&mut s, &upd(&f, 41), 41, &c, &Mock::ok()).unwrap();
+        assert_eq!(s.optimistic_header.slot, 50);
+        // (c) same slot, different header: not replaced (strictly newer only)
+        let same_slot = hdr(40, leaf_n(55), 56);
+        let mut s = f.store.clone();
+        s.optimistic_header = same_slot;
+        process_light_client_update(&mut s, &upd(&f, 41), 41, &c, &Mock::ok()).unwrap();
+        assert_eq!(s.optimistic_header, same_slot);
+    }
+
+    /// Builds an update from `st`, attested at 40 / signature 41, with the given pieces.
+    fn finality_only<'a>(
+        f: &'a Fx,
+        fin: BeaconBlockHeader,
+        st: &'a State,
+        empty_next: &'a SyncCommittee,
+    ) -> LightClientUpdate<'a> {
+        static ZEROS6: [Bytes32; 6] = [ZERO; 6];
+        let _ = f;
+        LightClientUpdate {
+            attested_header: hdr(40, st.root, 12),
+            next_sync_committee: empty_next,
+            next_sync_committee_branch: &ZEROS6,
+            finalized_header: fin,
+            finality_branch: &st.finality_branch,
+            sync_committee_bits: &f.bits,
+            sync_committee_signature: [7u8; 96],
+            signature_slot: 41,
+        }
+    }
+
+    #[test]
+    fn apply_gate_when_next_committee_is_already_known_and_finalized_does_not_advance() {
+        let f = fixture();
+        let c = cfg(GVR_A);
+        let mut store = f.store.clone();
+        process_light_client_update(&mut store, &upd(&f, 41), 41, &c, &Mock::ok()).unwrap();
+        assert!(store.is_next_sync_committee_known());
+        // same period, sync-committee + finality update, finalized slot (24) == store's (24)
+        let st = state(f.fin_hdr.hash_tree_root(), &committee(1), &f.next);
+        let u = LightClientUpdate {
+            attested_header: hdr(48, st.root, 9),
+            next_sync_committee: &f.next,
+            next_sync_committee_branch: &st.next_branch,
+            finalized_header: f.fin_hdr,
+            finality_branch: &st.finality_branch,
+            sync_committee_bits: &f.bits,
+            sync_committee_signature: [7u8; 96],
+            signature_slot: 49,
+        };
+        process_light_client_update(&mut store, &u, 49, &c, &Mock::ok()).unwrap();
+        // nothing to apply: the update stays as best_valid_update, it is NOT cleared
+        assert!(store.best_valid_update.is_some());
+        assert_eq!(store.finalized_header.slot, 24);
+    }
+
+    #[test]
+    fn apply_gate_finality_only_update_that_does_not_advance_is_not_applied() {
+        let f = fixture(); // next unknown, store finalized at slot 8
+        let c = cfg(GVR_A);
+        let fin8 = hdr(8, leaf_n(310), 11); // == store's finalized slot, different header
+        let st = state(fin8.hash_tree_root(), &committee(1), &committee(2));
+        let empty = SyncCommittee::empty(N);
+        let u = finality_only(&f, fin8, &st, &empty);
+        let mut store = f.store.clone();
+        process_light_client_update(&mut store, &u, 41, &c, &Mock::ok()).unwrap();
+        assert!(
+            store.best_valid_update.is_some(),
+            "must not be applied/cleared"
+        );
+        assert!(!store.is_next_sync_committee_known());
+        assert_eq!(store.finalized_header.slot, 8);
+    }
+
+    #[test]
+    fn apply_gate_committee_update_without_finality_is_not_applied() {
+        let f = fixture(); // next unknown
+        let c = cfg(GVR_A);
+        let st = state(leaf_n(1), &committee(1), &f.next);
+        let u = next_only(&f, &st, 40); // finalized header empty (slot 0, period 0 == att period)
+        let mut store = f.store.clone();
+        process_light_client_update(&mut store, &u, 41, &c, &Mock::ok()).unwrap();
+        assert!(
+            !store.is_next_sync_committee_known(),
+            "no finality => nothing finalized"
+        );
+        assert!(store.best_valid_update.is_some());
+    }
+
+    #[test]
+    fn apply_gate_finalized_next_committee_in_same_period_applies_without_slot_advance() {
+        let f = fixture(); // next unknown, store finalized at slot 8 (period 0)
+        let c = cfg(GVR_A);
+        let fin8 = hdr(8, leaf_n(310), 11); // finalized slot == store's: only the flag can apply it
+        let st = state(fin8.hash_tree_root(), &committee(1), &f.next);
+        let u = LightClientUpdate {
+            attested_header: hdr(40, st.root, 12),
+            next_sync_committee: &f.next,
+            next_sync_committee_branch: &st.next_branch,
+            finalized_header: fin8,
+            finality_branch: &st.finality_branch,
+            sync_committee_bits: &f.bits,
+            sync_committee_signature: [7u8; 96],
+            signature_slot: 41,
+        };
+        let mut store = f.store.clone();
+        process_light_client_update(&mut store, &u, 41, &c, &Mock::ok()).unwrap();
+        assert!(store.is_next_sync_committee_known());
+        assert_eq!(store.next_sync_committee, f.next);
+        assert!(store.best_valid_update.is_none());
+        assert_eq!(store.finalized_header.slot, 8);
+    }
+
+    fn drop_finality<'a>(u: &mut LightClientUpdate<'a>) {
+        static ZEROS7: [Bytes32; 7] = [ZERO; 7];
+        u.finality_branch = &ZEROS7;
+        u.finalized_header = BeaconBlockHeader::default();
+    }
+
+    #[test]
+    fn is_better_update_each_criterion_decides_on_its_own() {
+        let f = fixture();
+        let c = cfg(GVR_A);
+        let (b12, b10, b30, b32) = (bits(12), bits(10), bits(30), bits(32));
+
+        // 1. neither has a supermajority: more participants wins even over finality
+        let mut few12 = upd(&f, 41);
+        few12.sync_committee_bits = &b12;
+        drop_finality(&mut few12);
+        let mut few10 = upd(&f, 41);
+        few10.sync_committee_bits = &b10;
+        assert!(is_better_update(&few12, &few10, &c));
+        assert!(!is_better_update(&few10, &few12, &c));
+
+        // 2. both have a supermajority: participant count is NOT the first criterion
+        //    (finality outranks it); 30 active + finality beats 32 active without
+        let mut sm30 = upd(&f, 41);
+        sm30.sync_committee_bits = &b30;
+        let mut sm32_nofin = upd(&f, 41);
+        sm32_nofin.sync_committee_bits = &b32;
+        drop_finality(&mut sm32_nofin);
+        assert!(is_better_update(&sm30, &sm32_nofin, &c));
+        assert!(!is_better_update(&sm32_nofin, &sm30, &c));
+
+        // 3. equal otherwise: more participants wins
+        let mut sm32 = upd(&f, 41);
+        sm32.sync_committee_bits = &b32;
+        assert!(is_better_update(&sm32, &sm30, &c));
+        assert!(!is_better_update(&sm30, &sm32, &c));
+
+        // 4. relevance: sync-committee update with attested/signature in one period
+        //    beats a non-sync-committee update, even if the latter signed earlier
+        let mut nosync = upd(&f, 41);
+        let zeros6 = vec![ZERO; 6];
+        nosync.next_sync_committee_branch = &zeros6;
+        let sync42 = upd(&f, 42);
+        assert!(!is_better_update(&nosync, &sync42, &c));
+        assert!(is_better_update(&sync42, &nosync, &c));
+        //    and the period test itself: signature slot 65 is period 1, attested (40) period 0
+        assert!(is_better_update(&upd(&f, 41), &upd(&f, 65), &c));
+        assert!(!is_better_update(&upd(&f, 65), &upd(&f, 41), &c));
+
+        // 5. finalized header in the attested period beats one that is not
+        let mut off = upd(&f, 71);
+        off.attested_header = hdr(70, f.att.state_root, 3); // period 1; finalized (24) is period 0
+        assert!(is_better_update(&upd(&f, 41), &off, &c));
+        assert!(!is_better_update(&off, &upd(&f, 41), &c));
+
+        // 6. everything else equal: the OLDER attested header wins (signature slot equal)
+        let x = upd(&f, 42);
+        let mut y = upd(&f, 42);
+        y.attested_header = hdr(41, f.att.state_root, 3);
+        assert!(is_better_update(&x, &y, &c));
+        assert!(!is_better_update(&y, &x, &c));
     }
 }

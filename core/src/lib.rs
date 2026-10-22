@@ -59,6 +59,96 @@ pub enum Error {
     NextCommitteeNotEmpty,
     NextCommitteeMismatch,
     BadSignature,
+    /// Checkpoint is older than the operator's weak-subjectivity guideline
+    /// (`LightClientStore::assert_within_weak_subjectivity_period`). Not a spec assert.
+    CheckpointStale,
+    /// Participation is below 2/3. **Project-defined, not an Altair spec error**: the spec
+    /// accepts such an update as valid (it can move the optimistic header and
+    /// `best_valid_update`, never the finalized header). Returned only by the `wire` strict
+    /// gate, never by `process_light_client_update`, so the spec vectors are unaffected.
+    BelowThreshold,
+    /// The chain binding (chain ID, genesis validators root, fork schedule, preset timing)
+    /// the verifier expected differs from the one the proof commits to. Consumer-side check;
+    /// the guest itself cannot detect a mislabelled `chain_id`.
+    ChainMismatch,
+}
+
+/// Stable numeric error code. Numbers are part of the public contract (dry-run and on-chain
+/// paths report the same codes): never renumber or reuse a retired value.
+pub type ErrorCode = u16;
+
+impl Error {
+    /// Every variant, for coverage tests. Keep in sync with the enum; `code()` and
+    /// `message()` are exhaustive matches, so a new variant fails to compile until it has both.
+    pub const ALL: [Error; 18] = [
+        Error::BadConfig,
+        Error::UnsupportedFork,
+        Error::BadSyncCommitteeSize,
+        Error::TrustedRootMismatch,
+        Error::InvalidBranch,
+        Error::GenesisFinalizedHeaderNotEmpty,
+        Error::CommitteeSizeMismatch,
+        Error::InsufficientParticipants,
+        Error::BadSlotOrder,
+        Error::PeriodSkipped,
+        Error::UpdateNotRelevant,
+        Error::FinalizedHeaderNotEmpty,
+        Error::NextCommitteeNotEmpty,
+        Error::NextCommitteeMismatch,
+        Error::BadSignature,
+        Error::CheckpointStale,
+        Error::BelowThreshold,
+        Error::ChainMismatch,
+    ];
+
+    /// Stable code. Ranges: 1xx config, 2xx bootstrap/branches, 3xx update validity,
+    /// 4xx signature, 5xx policy and chain identity.
+    pub const fn code(&self) -> ErrorCode {
+        match self {
+            Error::BadConfig => 100,
+            Error::UnsupportedFork => 101,
+            Error::BadSyncCommitteeSize => 102,
+            Error::TrustedRootMismatch => 200,
+            Error::InvalidBranch => 201,
+            Error::GenesisFinalizedHeaderNotEmpty => 202,
+            Error::CommitteeSizeMismatch => 300,
+            Error::InsufficientParticipants => 301,
+            Error::BadSlotOrder => 302,
+            Error::PeriodSkipped => 303,
+            Error::UpdateNotRelevant => 304,
+            Error::FinalizedHeaderNotEmpty => 305,
+            Error::NextCommitteeNotEmpty => 306,
+            Error::NextCommitteeMismatch => 307,
+            Error::BadSignature => 400,
+            Error::CheckpointStale => 500,
+            Error::BelowThreshold => 501,
+            Error::ChainMismatch => 502,
+        }
+    }
+
+    /// Actionable, human-readable text. Static so it is usable in `no_std`.
+    pub const fn message(&self) -> &'static str {
+        match self {
+            Error::BadConfig => "chain configuration is invalid (zero slots_per_epoch, zero epochs_per_period, or malformed fork schedule); fix the spec/config input",
+            Error::UnsupportedFork => "slot is at or after a fork whose light-client layout is not supported; use a newer verifier build",
+            Error::BadSyncCommitteeSize => "sync committee size is not a power of two within the supported maximum; check the preset",
+            Error::TrustedRootMismatch => "bootstrap header does not hash to the trusted block root; obtain the bootstrap for the configured checkpoint or re-check the checkpoint",
+            Error::InvalidBranch => "Merkle branch does not prove the claimed value under the given state root; the update or bootstrap data is corrupt or forged",
+            Error::GenesisFinalizedHeaderNotEmpty => "finalized header at the genesis slot must be the empty header",
+            Error::CommitteeSizeMismatch => "participation bitfield or next committee size does not match the current sync committee",
+            Error::InsufficientParticipants => "update has no sync committee participants",
+            Error::BadSlotOrder => "slots must satisfy current >= signature > attested >= finalized",
+            Error::PeriodSkipped => "update signature period is not the store's period (or the next one when the next committee is known); fetch the intermediate period updates first",
+            Error::UpdateNotRelevant => "update is not newer than the finalized header and offers no next sync committee; nothing to apply",
+            Error::FinalizedHeaderNotEmpty => "update carries a finalized header but no finality branch",
+            Error::NextCommitteeNotEmpty => "update carries a next sync committee but no next-committee branch",
+            Error::NextCommitteeMismatch => "update offers a next sync committee different from the one already proven for this period",
+            Error::BadSignature => "sync committee aggregate signature is invalid for this chain's signing domain; check genesis_validators_root, fork versions and the signing committee",
+            Error::CheckpointStale => "finalized checkpoint is older than the weak-subjectivity guideline; obtain a fresher trusted checkpoint",
+            Error::BelowThreshold => "sync committee participation is below 2/3; update rejected without verifying the signature",
+            Error::ChainMismatch => "proof commits to a different chain than expected (chain ID, genesis_validators_root, fork schedule or preset timing); verify against the correct chain",
+        }
+    }
 }
 
 pub fn hash_pair(a: &Bytes32, b: &Bytes32) -> Bytes32 {
@@ -751,5 +841,64 @@ mod tests {
                 Err(Error::InvalidBranch)
             );
         }
+    }
+
+    // ---- stable error codes ---------------------------------------------------------------
+
+    #[test]
+    fn every_error_has_a_unique_code_and_a_message() {
+        for (i, e) in Error::ALL.iter().enumerate() {
+            assert_ne!(e.code(), 0, "{e:?}");
+            assert!(e.message().len() > 10, "{e:?}");
+            for o in &Error::ALL[i + 1..] {
+                assert_ne!(e.code(), o.code(), "{e:?} vs {o:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn error_code_numbering_is_pinned() {
+        // Changing any of these is a breaking change to the public error contract.
+        let pinned: [(Error, ErrorCode); 18] = [
+            (Error::BadConfig, 100),
+            (Error::UnsupportedFork, 101),
+            (Error::BadSyncCommitteeSize, 102),
+            (Error::TrustedRootMismatch, 200),
+            (Error::InvalidBranch, 201),
+            (Error::GenesisFinalizedHeaderNotEmpty, 202),
+            (Error::CommitteeSizeMismatch, 300),
+            (Error::InsufficientParticipants, 301),
+            (Error::BadSlotOrder, 302),
+            (Error::PeriodSkipped, 303),
+            (Error::UpdateNotRelevant, 304),
+            (Error::FinalizedHeaderNotEmpty, 305),
+            (Error::NextCommitteeNotEmpty, 306),
+            (Error::NextCommitteeMismatch, 307),
+            (Error::BadSignature, 400),
+            (Error::CheckpointStale, 500),
+            (Error::BelowThreshold, 501),
+            (Error::ChainMismatch, 502),
+        ];
+        assert_eq!(pinned.len(), Error::ALL.len());
+        for (e, c) in pinned {
+            assert_eq!(e.code(), c, "{e:?}");
+            assert!(Error::ALL.contains(&e), "{e:?} missing from Error::ALL");
+        }
+    }
+
+    #[test]
+    fn subtree_index_strips_the_leading_one_bit() {
+        // Through `is_valid_normalized_merkle_branch` only the low `depth` bits are ever read, so
+        // a wrong high bit is invisible there; pin the function itself.
+        assert_eq!(get_subtree_index(1), 0);
+        assert_eq!(get_subtree_index(2), 0);
+        assert_eq!(get_subtree_index(3), 1);
+        assert_eq!(get_subtree_index(25), 9); // execution payload in BeaconBlockBody
+        assert_eq!(get_subtree_index(54), 22); // altair current_sync_committee
+        assert_eq!(get_subtree_index(55), 23); // altair next_sync_committee
+        assert_eq!(get_subtree_index(105), 41); // altair finalized root
+        assert_eq!(get_subtree_index(86), 22); // electra current_sync_committee
+        assert_eq!(get_subtree_index(87), 23); // electra next_sync_committee
+        assert_eq!(get_subtree_index(169), 41); // electra finalized root
     }
 }

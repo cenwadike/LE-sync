@@ -37,3 +37,16 @@ unchecked-pubkeys = []
 
 [dev-dependencies]
 sha2 = { version = "0.10", default-features = false }
+# Test-only fixtures + an independent native signer (see testkit/src/lib.rs). It uses the same
+# risc0 `bls12_381` fork as the optional dependency above, so the graph keeps a single copy.
+# The previous dev-dependency on the risc0 `blst` fork is no longer used by any test and was
+# removed (it forced a C build of blst into every wire test run). Re-add it only if a test
+# needs it, and keep it on the same git + tag as the optional `blst` above (`links = "blst"`).
+le-sync-testkit = { path = "../testkit" }
+
+# Real-BLS negative suite. Skipped silently unless run with `--features bls-zk`:
+#   cargo test -p le-sync-wire --features bls-zk
+[[test]]
+name = "negative"
+path = "tests/negative.rs"
+required-features = ["bls-zk"]

@@ -1,13 +1,13 @@
 //! Guest input/output types and `verify`, the whole of what the zkVM guest executes
-//! (Sprint 1 scope: bootstrap + finality branches; Sprint 2 `sync` goes here next).
+//! (bootstrap, finality branches, sync-update validation incl. BLS, chain-binding commitment).
 //! Kept free of risc0 so it runs natively in tests; the guest is a 3-line wrapper.
 //!
 //! serde note: `[u8; 48]` has no serde impl, so pubkeys travel as one flat `Vec<u8>`.
 pub mod bls;
 
 use le_sync_core::sync::{
-    initialize_light_client_store, process_light_client_update, Bls, ForkSchedule,
-    LightClientUpdate, SyncCommittee, SyncConfig,
+    has_supermajority, initialize_light_client_store, process_light_client_update, Bls,
+    ChainBinding, ForkSchedule, LightClientStore, LightClientUpdate, SyncCommittee, SyncConfig,
 };
 use le_sync_core::{
     is_branch_present, verify_bootstrap, verify_finality_branch, BeaconBlockHeader, BlsPubkey,
@@ -77,6 +77,10 @@ pub struct UpdateWire {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SyncInput {
+    /// Declared chain label (`DEPOSIT_CHAIN_ID`). NOT signed by anything: it is committed in
+    /// the journal's chain binding, and only a verifier-side `check_chain_binding` against an
+    /// expected binding gives it meaning.
+    pub chain_id: u64,
     pub genesis_validators_root: Bytes32,
     pub epochs_per_period: u64,
     /// Ascending `(fork_epoch, fork_version)`, genesis first.
@@ -116,10 +120,23 @@ pub struct GuestOutput {
     pub sync_validated: u32,
     /// Older than the store (spec: not relevant) - not an attack, not counted as failure.
     pub sync_not_relevant: u32,
+    /// Every update not counted as validated or not-relevant (includes `sync_below_threshold`).
     pub sync_rejected: u32,
+    /// Subset of `sync_rejected`: participation below 2/3, rejected by the strict gate
+    /// before any signature work. Project-defined (not an Altair spec error).
+    pub sync_below_threshold: u32,
     pub finalized_slot: u64,
     pub finalized_root: Bytes32,
+    /// Advances only from supermajority (>= 2/3) updates under the strict gate.
     pub optimistic_slot: u64,
+    /// Chain identity, populated whenever the input had a `sync` section (even if bootstrap
+    /// failed), zero otherwise. `chain_id` is a declared label; `genesis_validators_root` and
+    /// the fork versions are the cryptographically bound parts (via the signing domain).
+    pub chain_id: u64,
+    pub genesis_validators_root: Bytes32,
+    /// `ChainBinding::digest()` over chain id, gvr, fork-schedule hash and preset timing.
+    /// Zero when there is no sync section or the fork schedule is malformed (fail closed).
+    pub chain_binding: Bytes32,
 }
 
 impl GuestOutput {
@@ -133,15 +150,102 @@ impl GuestOutput {
     }
 
     /// Sprint 2 rule (only meaningful when the input had a `sync` section):
-    /// normal run -> something validated, nothing rejected;
+    /// normal run -> something validated, and the only rejections are below-threshold ones
+    /// (a live finality update with < 2/3 participation is expected, not an attack);
     /// `expect_reject` (bad signature / other chain) -> nothing validated, something rejected.
     pub fn sync_success(&self, expect_reject: bool) -> bool {
         if expect_reject {
             self.sync_validated == 0 && self.sync_rejected > 0
         } else {
-            self.sync_validated > 0 && self.sync_rejected == 0
+            self.sync_validated > 0 && self.sync_rejected == self.sync_below_threshold
         }
     }
+}
+
+/// Per-update verdict, for tests, the CLI dry run and anything that needs the typed error
+/// code (Usability #2). NOT committed to the journal: the proof format is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    Validated,
+    /// Older than the store (spec: not relevant).
+    NotRelevant,
+    /// Rejected with the typed error (`Error::code()` is the stable public code).
+    Rejected(Error),
+    /// The update's own bytes could not be parsed (bad signature length, bad next committee).
+    Malformed,
+    /// The run never reached this update: bootstrap or sync setup failed.
+    SetupFailed(Error),
+}
+
+/// `verify`'s journal plus one `UpdateOutcome` per update, in input order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trace {
+    pub output: GuestOutput,
+    pub updates: Vec<UpdateOutcome>,
+}
+
+fn note(t: &mut Option<&mut Vec<UpdateOutcome>>, o: UpdateOutcome) {
+    if let Some(v) = t.as_mut() {
+        v.push(o);
+    }
+}
+
+/// Build the chain binding from raw configuration. Used by `verify` to fill the journal and by
+/// verifiers/hosts to build the binding they EXPECT, so both sides share one code path.
+/// `Err(BadConfig)` if the fork schedule is malformed.
+pub fn build_chain_binding(
+    slots_per_epoch: u64,
+    epochs_per_period: u64,
+    chain_id: u64,
+    genesis_validators_root: &Bytes32,
+    forks: &[(u64, [u8; 4])],
+) -> Result<ChainBinding, Error> {
+    Ok(ChainBinding {
+        chain_id,
+        genesis_validators_root: *genesis_validators_root,
+        fork_schedule_hash: ForkSchedule::new(forks)?.hash(),
+        slots_per_epoch,
+        epochs_per_period,
+    })
+}
+
+/// Consumer-side chain check. Call it FIRST, before trusting anything else in the journal.
+///
+/// 1. The committed digest must equal the digest of the expected binding.
+/// 2. The readable `chain_id` and `genesis_validators_root` must equal the expected ones, so
+///    the plain fields cannot be forged against a correct digest (or vice versa).
+///
+/// Returns `Error::ChainMismatch` otherwise, including for a journal with no sync section
+/// (zero binding). Limit: the guest cannot tell whether `chain_id` is the true label for the
+/// gvr; that assurance exists only because the verifier supplies the expected binding.
+pub fn check_chain_binding(out: &GuestOutput, expected: &ChainBinding) -> Result<(), Error> {
+    expected.check_digest(&out.chain_binding)?;
+    if out.chain_id != expected.chain_id
+        || out.genesis_validators_root != expected.genesis_validators_root
+    {
+        return Err(Error::ChainMismatch);
+    }
+    Ok(())
+}
+
+/// Strict gate for the guest and host. Updates with participation below 2/3 are rejected as
+/// `Error::BelowThreshold` BEFORE any other validation or BLS work, leaving the store
+/// untouched (no optimistic move, no `best_valid_update`). `le_sync_core` stays spec-faithful
+/// (the official vectors call it directly); only this wrapper is stricter.
+///
+/// Trade-off: rejection is classified by participation alone, so a sub-2/3 update that is also
+/// stale, malformed or badly signed reports `BelowThreshold`, not its other defect.
+pub fn process_update_strict<B: Bls>(
+    store: &mut LightClientStore,
+    update: &LightClientUpdate,
+    current_slot: u64,
+    cfg: &SyncConfig,
+    bls: &B,
+) -> Result<(), Error> {
+    if !has_supermajority(update.sync_committee_bits) {
+        return Err(Error::BelowThreshold);
+    }
+    process_light_client_update(store, update, current_slot, cfg, bls)
 }
 
 #[inline(always)]
@@ -183,18 +287,27 @@ fn run_sync<B: Bls>(
     cfg: ChainConfig,
     bls: &B,
     out: &mut GuestOutput,
+    mut trace: Option<&mut Vec<UpdateOutcome>>,
 ) {
     let ta = cc();
     let n_updates = s.updates.len() as u32;
     let header = BeaconBlockHeader::from(&i.boot_header);
-    let setup = (|| {
-        let forks = ForkSchedule::new(&s.forks).ok()?;
-        let c = committee_from(&i.pubkeys, &i.aggregate, i.pubkeys.len() / 48)?;
-        Some((forks, c))
+    let setup = (|| -> Result<_, Error> {
+        let forks = ForkSchedule::new(&s.forks)?;
+        // The size argument only matters when both the keys and the aggregate are empty, and
+        // `verify` has already rejected such a bootstrap before `run_sync` is reached.
+        let c = committee_from(&i.pubkeys, &i.aggregate, 0).ok_or(Error::BadSyncCommitteeSize)?;
+        Ok((forks, c))
     })();
-    let Some((forks, committee)) = setup else {
-        out.sync_rejected = n_updates;
-        return;
+    let (forks, committee) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            out.sync_rejected = n_updates;
+            for _ in &s.updates {
+                note(&mut trace, UpdateOutcome::SetupFailed(e));
+            }
+            return;
+        }
     };
     let tb = cc();
     let size = committee.len;
@@ -204,11 +317,21 @@ fn run_sync<B: Bls>(
         genesis_validators_root: s.genesis_validators_root,
         forks,
     };
-    let Ok(mut store) =
-        initialize_light_client_store(&scfg, &i.trusted_root, &header, committee, &i.boot_branch)
-    else {
-        out.sync_rejected = n_updates;
-        return;
+    let mut store = match initialize_light_client_store(
+        &scfg,
+        &i.trusted_root,
+        &header,
+        committee,
+        &i.boot_branch,
+    ) {
+        Ok(st) => st,
+        Err(e) => {
+            out.sync_rejected = n_updates;
+            for _ in &s.updates {
+                note(&mut trace, UpdateOutcome::SetupFailed(e));
+            }
+            return;
+        }
     };
     let tc = cc();
 
@@ -220,6 +343,7 @@ fn run_sync<B: Bls>(
         })();
         let Some((next, sig)) = parsed else {
             out.sync_rejected += 1;
+            note(&mut trace, UpdateOutcome::Malformed);
             continue;
         };
         let zeros6;
@@ -239,10 +363,24 @@ fn run_sync<B: Bls>(
             sync_committee_signature: sig,
             signature_slot: u.signature_slot,
         };
-        match process_light_client_update(&mut store, &lcu, s.current_slot, &scfg, bls) {
-            Ok(()) => out.sync_validated += 1,
-            Err(Error::UpdateNotRelevant) => out.sync_not_relevant += 1,
-            Err(_) => out.sync_rejected += 1,
+        match process_update_strict(&mut store, &lcu, s.current_slot, &scfg, bls) {
+            Ok(()) => {
+                out.sync_validated += 1;
+                note(&mut trace, UpdateOutcome::Validated);
+            }
+            Err(Error::UpdateNotRelevant) => {
+                out.sync_not_relevant += 1;
+                note(&mut trace, UpdateOutcome::NotRelevant);
+            }
+            Err(Error::BelowThreshold) => {
+                out.sync_rejected += 1;
+                out.sync_below_threshold += 1;
+                note(&mut trace, UpdateOutcome::Rejected(Error::BelowThreshold));
+            }
+            Err(e) => {
+                out.sync_rejected += 1;
+                note(&mut trace, UpdateOutcome::Rejected(e));
+            }
         }
     }
     let td = cc();
@@ -258,7 +396,24 @@ fn run_sync<B: Bls>(
 }
 
 /// Never panics on malformed input: it just reports `bootstrap_ok = false` / rejections.
+/// This is the guest's entry point; the journal it returns is exactly what gets committed.
 pub fn verify<B: Bls>(i: &GuestInput, bls: &B) -> GuestOutput {
+    verify_inner(i, bls, None)
+}
+
+/// Same run as `verify` (identical `output`), plus the typed per-update verdicts. Host/test
+/// side only: the guest calls `verify`, so the journal format and cycle profile are unchanged.
+pub fn verify_trace<B: Bls>(i: &GuestInput, bls: &B) -> Trace {
+    let mut updates = Vec::new();
+    let output = verify_inner(i, bls, Some(&mut updates));
+    Trace { output, updates }
+}
+
+fn verify_inner<B: Bls>(
+    i: &GuestInput,
+    bls: &B,
+    mut trace: Option<&mut Vec<UpdateOutcome>>,
+) -> GuestOutput {
     let cfg = ChainConfig {
         slots_per_epoch: i.slots_per_epoch,
         electra_fork_epoch: i.electra_fork_epoch,
@@ -268,21 +423,40 @@ pub fn verify<B: Bls>(i: &GuestInput, bls: &B) -> GuestOutput {
         trusted_root: i.trusted_root,
         ..Default::default()
     };
+    // Chain identity first, so even a run whose bootstrap fails states which chain it was about.
+    if let Some(s) = &i.sync {
+        out.chain_id = s.chain_id;
+        out.genesis_validators_root = s.genesis_validators_root;
+        if let Ok(b) = build_chain_binding(
+            i.slots_per_epoch,
+            s.epochs_per_period,
+            s.chain_id,
+            &s.genesis_validators_root,
+            &s.forks,
+        ) {
+            out.chain_binding = b.digest();
+        }
+    }
     let header = BeaconBlockHeader::from(&i.boot_header);
     let agg: Option<BlsPubkey> = i.aggregate.as_slice().try_into().ok();
     let t0 = cc();
-    out.bootstrap_ok = match (pubkeys(&i.pubkeys), agg) {
+    let boot: Result<(), Error> = match (pubkeys(&i.pubkeys), agg) {
         (Some(keys), Some(agg)) => {
-            verify_bootstrap(&cfg, &i.trusted_root, &header, &keys, &agg, &i.boot_branch).is_ok()
+            verify_bootstrap(&cfg, &i.trusted_root, &header, &keys, &agg, &i.boot_branch)
         }
-        _ => false,
+        (None, _) => Err(Error::BadSyncCommitteeSize),
+        (_, None) => Err(Error::BadConfig),
     };
+    out.bootstrap_ok = boot.is_ok();
     let t1 = cc();
     // Spec: no further trust in anything if the anchor is not the trusted root.
-    if !out.bootstrap_ok {
+    if let Err(e) = boot {
         out.finality_fail = i.finality.len() as u32;
         if let Some(s) = &i.sync {
             out.sync_rejected = s.updates.len() as u32;
+            for _ in &s.updates {
+                note(&mut trace, UpdateOutcome::SetupFailed(e));
+            }
         }
         return out;
     }
@@ -311,7 +485,7 @@ pub fn verify<B: Bls>(i: &GuestInput, bls: &B) -> GuestOutput {
         t2 - t1
     ));
     if let Some(s) = &i.sync {
-        run_sync(i, s, cfg, bls, &mut out);
+        run_sync(i, s, cfg, bls, &mut out, trace);
     }
     out
 }
@@ -324,6 +498,7 @@ mod tests {
     const N: usize = 32;
     const GVR: Bytes32 = [0xAA; 32];
     const FV: Version = [5, 0, 0, 1];
+    const CHAIN_ID: u64 = 1;
 
     /// Accepts iff the signature starts with 7 and the signing root is the one for `GVR`/`FV`.
     struct Mock;
@@ -375,10 +550,16 @@ mod tests {
         }
     }
     fn fixture() -> GuestInput {
+        fixture_seeded(0)
+    }
+    /// `seed` changes the committee keys (and so the bootstrap state root and trusted root);
+    /// seed 0 is the honest fixture.
+    fn fixture_seeded(seed: u8) -> GuestInput {
         let keys: Vec<BlsPubkey> = (0..N)
             .map(|i| {
                 let mut k = [0u8; 48];
                 k[0] = i as u8 + 1;
+                k[1] = seed;
                 k
             })
             .collect();
@@ -420,7 +601,6 @@ mod tests {
                 },
             ],
             sync: None,
-            // (sync section is attached by `with_sync`)
         }
     }
 
@@ -428,6 +608,7 @@ mod tests {
     fn with_sync(mut i: GuestInput) -> GuestInput {
         let f = i.finality[0].clone();
         i.sync = Some(SyncInput {
+            chain_id: CHAIN_ID,
             genesis_validators_root: GVR,
             epochs_per_period: 8,
             forks: vec![(0, FV)],
@@ -504,13 +685,13 @@ mod tests {
     #[test]
     fn sync_bad_signature_and_other_chain_are_rejected() {
         let mut i = with_sync(fixture());
-        i.sync.as_mut().unwrap().updates[0].signature[0] ^= 1; // tampered signature
+        i.sync.as_mut().unwrap().updates[0].signature[0] ^= 1;
         let o = verify(&i, &Mock);
         assert_eq!((o.sync_validated, o.sync_rejected), (0, 1));
         assert!(o.sync_success(true) && !o.sync_success(false));
 
         let mut i = with_sync(fixture());
-        i.sync.as_mut().unwrap().genesis_validators_root = [0xBB; 32]; // other chain config
+        i.sync.as_mut().unwrap().genesis_validators_root = [0xBB; 32];
         let o = verify(&i, &Mock);
         assert_eq!((o.sync_validated, o.sync_rejected), (0, 1));
     }
@@ -519,7 +700,7 @@ mod tests {
     fn sync_old_update_is_not_relevant_not_rejected() {
         let mut i = with_sync(fixture());
         let u = &mut i.sync.as_mut().unwrap().updates[0];
-        u.attested.slot = 8; // not newer than the bootstrap's finalized slot
+        u.attested.slot = 8;
         u.finalized = hdr(0, ZERO);
         u.finality_branch = vec![ZERO; 7];
         let o = verify(&i, &Mock);
@@ -532,5 +713,453 @@ mod tests {
         i.trusted_root = [0; 32];
         let o = verify(&i, &Mock);
         assert_eq!((o.sync_validated, o.sync_rejected), (0, 1));
+    }
+
+    #[test]
+    fn fabricated_bootstrap_rejected() {
+        let honest = with_sync(fixture());
+        let attacker = fixture_seeded(1);
+        let mut i = honest.clone();
+        i.boot_header = attacker.boot_header.clone();
+        i.pubkeys = attacker.pubkeys.clone();
+        i.aggregate = attacker.aggregate.clone();
+        i.boot_branch = attacker.boot_branch.clone();
+        assert_eq!(
+            i.trusted_root, honest.trusted_root,
+            "trusted root is unchanged"
+        );
+
+        let own = verify_bootstrap(
+            &ChainConfig {
+                slots_per_epoch: 8,
+                electra_fork_epoch: 0,
+                gloas_fork_epoch: None,
+            },
+            &attacker.trusted_root,
+            &(&i.boot_header).into(),
+            &pubkeys(&i.pubkeys).unwrap(),
+            &i.aggregate.as_slice().try_into().unwrap(),
+            &i.boot_branch,
+        );
+        assert_eq!(own, Ok(()));
+
+        let o = verify(&i, &Mock);
+        assert!(!o.bootstrap_ok);
+        assert_eq!((o.sync_validated, o.sync_rejected), (0, 1));
+        assert_eq!((o.finalized_slot, o.finalized_root), (0, ZERO));
+        assert_eq!(o.trusted_root, honest.trusted_root);
+    }
+
+    struct Counting(std::cell::Cell<u32>);
+    impl Bls for Counting {
+        fn fast_aggregate_verify(
+            &self,
+            c: &[BlsPubkey],
+            a: &BlsPubkey,
+            bits: &[u8],
+            root: &Bytes32,
+            sig: &le_sync_core::sync::BlsSignature,
+        ) -> bool {
+            self.0.set(self.0.get() + 1);
+            Mock.fast_aggregate_verify(c, a, bits, root, sig)
+        }
+    }
+
+    fn low_bits() -> Vec<u8> {
+        vec![0xFF, 0x0F, 0x00, 0x00] // 12 of 32 set
+    }
+
+    #[test]
+    fn below_threshold_rejected_and_store_untouched() {
+        let mut i = with_sync(fixture());
+        i.sync.as_mut().unwrap().updates[0].bits = low_bits();
+        let bls = Counting(Default::default());
+        let o = verify(&i, &bls);
+        assert_eq!(
+            (o.sync_validated, o.sync_rejected, o.sync_below_threshold),
+            (0, 1, 1),
+            "{o:?}"
+        );
+        assert_eq!(bls.0.get(), 0, "no pairing work for a sub-2/3 update");
+        assert_eq!(o.finalized_root, i.trusted_root);
+        assert_eq!((o.finalized_slot, o.optimistic_slot), (8, 8));
+        assert!(o.sync_success(true) && !o.sync_success(false));
+    }
+
+    #[test]
+    fn exactly_two_thirds_is_not_below_threshold() {
+        let mut i = with_sync(fixture());
+        i.sync.as_mut().unwrap().updates[0].bits = vec![0xFF, 0xFF, 0x3F, 0x00];
+        let o = verify(&i, &Mock);
+        assert_eq!((o.sync_validated, o.sync_below_threshold), (1, 0), "{o:?}");
+    }
+
+    #[test]
+    fn sync_success_tolerates_only_below_threshold_rejections() {
+        let mut i = with_sync(fixture());
+        let mut low = i.sync.as_ref().unwrap().updates[0].clone();
+        low.bits = low_bits();
+        i.sync.as_mut().unwrap().updates.push(low);
+        let o = verify(&i, &Mock);
+        assert_eq!(
+            (o.sync_validated, o.sync_rejected, o.sync_below_threshold),
+            (1, 1, 1)
+        );
+        assert!(
+            o.sync_success(false),
+            "below-threshold alone is not a failure"
+        );
+        assert!(!o.sync_success(true));
+
+        let mut i = with_sync(fixture());
+        let mut bad = i.sync.as_ref().unwrap().updates[0].clone();
+        bad.signature[0] ^= 1;
+        i.sync.as_mut().unwrap().updates.push(bad);
+        let o = verify(&i, &Mock);
+        assert_eq!(
+            (o.sync_validated, o.sync_rejected, o.sync_below_threshold),
+            (1, 1, 0)
+        );
+        assert!(!o.sync_success(false));
+    }
+
+    fn expected_binding(chain_id: u64, gvr: &Bytes32) -> ChainBinding {
+        build_chain_binding(8, 8, chain_id, gvr, &[(0, FV)]).unwrap()
+    }
+
+    #[test]
+    fn journal_commits_chain_config() {
+        let i = with_sync(fixture());
+        let o = verify(&i, &Mock);
+        let s = i.sync.as_ref().unwrap();
+        assert_eq!(o.chain_id, s.chain_id);
+        assert_eq!(o.genesis_validators_root, s.genesis_validators_root);
+        assert_eq!(o.chain_binding, expected_binding(CHAIN_ID, &GVR).digest());
+        assert_ne!(o.chain_binding, ZERO);
+
+        let mut bad = i.clone();
+        bad.trusted_root = [0; 32];
+        let ob = verify(&bad, &Mock);
+        assert!(!ob.bootstrap_ok);
+        assert_eq!(ob.chain_binding, o.chain_binding);
+
+        let n = verify(&fixture(), &Mock);
+        assert_eq!(
+            (n.chain_id, n.genesis_validators_root, n.chain_binding),
+            (0, ZERO, ZERO)
+        );
+
+        let mut mf = i.clone();
+        mf.sync.as_mut().unwrap().forks = vec![];
+        let om = verify(&mf, &Mock);
+        assert_eq!((om.chain_id, om.chain_binding), (CHAIN_ID, ZERO));
+        assert_eq!((om.sync_validated, om.sync_rejected), (0, 1));
+    }
+
+    #[test]
+    fn journals_differ_when_only_gvr_differs() {
+        let a = with_sync(fixture());
+        let mut b = a.clone();
+        b.sync.as_mut().unwrap().genesis_validators_root = [0xBB; 32];
+        let (oa, ob) = (verify(&a, &Mock), verify(&b, &Mock));
+        assert_ne!(oa, ob);
+        assert_ne!(oa.chain_binding, ob.chain_binding);
+        assert_ne!(oa.genesis_validators_root, ob.genesis_validators_root);
+    }
+
+    #[test]
+    fn verify_is_deterministic() {
+        let i = with_sync(fixture());
+        let (a, b) = (verify(&i, &Mock), verify(&i, &Mock));
+        assert_eq!(a, b);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    #[test]
+    fn check_chain_binding_accepts_match() {
+        let o = verify(&with_sync(fixture()), &Mock);
+        assert_eq!(
+            check_chain_binding(&o, &expected_binding(CHAIN_ID, &GVR)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_chain_binding_rejects_wrong_chain_id() {
+        let o = verify(&with_sync(fixture()), &Mock);
+        assert_eq!(
+            check_chain_binding(&o, &expected_binding(CHAIN_ID + 1, &GVR)),
+            Err(Error::ChainMismatch)
+        );
+    }
+
+    #[test]
+    fn check_chain_binding_rejects_wrong_gvr() {
+        let o = verify(&with_sync(fixture()), &Mock);
+        assert_eq!(
+            check_chain_binding(&o, &expected_binding(CHAIN_ID, &[0xBB; 32])),
+            Err(Error::ChainMismatch)
+        );
+    }
+
+    #[test]
+    fn check_chain_binding_rejects_other_fork_schedule_and_preset() {
+        let o = verify(&with_sync(fixture()), &Mock);
+        let other_fork = build_chain_binding(8, 8, CHAIN_ID, &GVR, &[(0, [6, 0, 0, 1])]).unwrap();
+        assert_eq!(
+            check_chain_binding(&o, &other_fork),
+            Err(Error::ChainMismatch)
+        );
+        let other_preset = build_chain_binding(32, 256, CHAIN_ID, &GVR, &[(0, FV)]).unwrap();
+        assert_eq!(
+            check_chain_binding(&o, &other_preset),
+            Err(Error::ChainMismatch)
+        );
+    }
+
+    #[test]
+    fn check_chain_binding_rejects_readable_fields_forged_against_digest() {
+        let exp = expected_binding(CHAIN_ID, &GVR);
+        let other = verify(&with_sync(fixture()), &Mock);
+        let mut forged = GuestOutput {
+            chain_binding: expected_binding(CHAIN_ID + 1, &GVR).digest(),
+            ..other.clone()
+        };
+        forged.chain_id = CHAIN_ID;
+        assert_eq!(
+            check_chain_binding(&forged, &exp),
+            Err(Error::ChainMismatch)
+        );
+        let mut tampered = other.clone();
+        tampered.chain_id = 999;
+        assert_eq!(
+            check_chain_binding(&tampered, &exp),
+            Err(Error::ChainMismatch)
+        );
+        let mut tampered = other;
+        tampered.genesis_validators_root = [0xCC; 32];
+        assert_eq!(
+            check_chain_binding(&tampered, &exp),
+            Err(Error::ChainMismatch)
+        );
+    }
+
+    #[test]
+    fn check_chain_binding_rejects_journal_without_sync_section() {
+        let o = verify(&fixture(), &Mock);
+        assert_eq!(
+            check_chain_binding(&o, &expected_binding(CHAIN_ID, &GVR)),
+            Err(Error::ChainMismatch)
+        );
+    }
+
+    #[test]
+    fn mislabeled_chain_id_passes_guest_but_fails_consumer_check() {
+        let mut i = with_sync(fixture());
+        i.sync.as_mut().unwrap().chain_id = 999;
+        let o = verify(&i, &Mock);
+        assert_eq!(
+            (o.sync_validated, o.sync_rejected),
+            (1, 0),
+            "guest accepts: {o:?}"
+        );
+        assert!(o.sync_success(false));
+        assert_eq!(
+            check_chain_binding(&o, &expected_binding(CHAIN_ID, &GVR)),
+            Err(Error::ChainMismatch),
+            "consumer expecting chain 1 rejects the mislabel"
+        );
+        assert_eq!(
+            check_chain_binding(&o, &expected_binding(999, &GVR)),
+            Ok(())
+        );
+    }
+
+    // ---- success / sync_success matrix (cargo-mutants hardening) ----------------------------
+
+    fn go(
+        bootstrap_ok: bool,
+        finality_pass: u32,
+        finality_fail: u32,
+        sync_validated: u32,
+        sync_rejected: u32,
+        sync_below_threshold: u32,
+    ) -> GuestOutput {
+        GuestOutput {
+            bootstrap_ok,
+            finality_pass,
+            finality_fail,
+            sync_validated,
+            sync_rejected,
+            sync_below_threshold,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn success_non_tamper_requires_all_three_conjuncts() {
+        assert!(go(true, 1, 0, 0, 0, 0).success(false));
+        assert!(!go(false, 1, 0, 0, 0, 0).success(false));
+        assert!(!go(true, 0, 0, 0, 0, 0).success(false));
+        assert!(!go(true, 1, 1, 0, 0, 0).success(false));
+        assert!(!go(true, 2, 1, 0, 0, 0).success(false));
+    }
+
+    #[test]
+    fn success_tamper_requires_all_three_conjuncts() {
+        assert!(go(false, 0, 1, 0, 0, 0).success(true));
+        assert!(!go(true, 0, 1, 0, 0, 0).success(true));
+        assert!(!go(false, 1, 1, 0, 0, 0).success(true));
+        assert!(!go(false, 0, 0, 0, 0, 0).success(true));
+        assert!(go(false, 0, 3, 0, 0, 0).success(true));
+    }
+
+    #[test]
+    fn success_tamper_flag_selects_opposite_rules() {
+        let good_normal = go(true, 1, 0, 0, 0, 0);
+        let good_tamper = go(false, 0, 1, 0, 0, 0);
+        assert!(good_normal.success(false));
+        assert!(!good_normal.success(true));
+        assert!(good_tamper.success(true));
+        assert!(!good_tamper.success(false));
+    }
+
+    #[test]
+    fn sync_success_normal_requires_validated_and_only_below_threshold_rejects() {
+        assert!(go(true, 1, 0, 1, 0, 0).sync_success(false));
+        assert!(go(true, 1, 0, 2, 1, 1).sync_success(false));
+        assert!(!go(true, 1, 0, 0, 0, 0).sync_success(false));
+        assert!(!go(true, 1, 0, 1, 1, 0).sync_success(false));
+        assert!(!go(true, 1, 0, 1, 2, 1).sync_success(false));
+        assert!(!go(true, 1, 0, 0, 1, 1).sync_success(false));
+    }
+
+    #[test]
+    fn sync_success_expect_reject_requires_zero_validated_and_some_rejected() {
+        assert!(go(true, 1, 0, 0, 1, 0).sync_success(true));
+        assert!(go(true, 1, 0, 0, 1, 1).sync_success(true));
+        assert!(!go(true, 1, 0, 1, 1, 0).sync_success(true));
+        assert!(!go(true, 1, 0, 0, 0, 0).sync_success(true));
+        assert!(!go(true, 1, 0, 1, 0, 0).sync_success(true));
+    }
+
+    #[test]
+    fn sync_success_flag_selects_opposite_rules() {
+        let normal_ok = go(true, 1, 0, 1, 0, 0);
+        let reject_ok = go(true, 1, 0, 0, 1, 0);
+        assert!(normal_ok.sync_success(false));
+        assert!(!normal_ok.sync_success(true));
+        assert!(reject_ok.sync_success(true));
+        assert!(!reject_ok.sync_success(false));
+    }
+
+    #[test]
+    fn sync_success_is_independent_of_sprint1_fields() {
+        // Mutants that mix success() and sync_success() die here.
+        let sprint1_fail = go(false, 0, 0, 1, 0, 0);
+        assert!(!sprint1_fail.success(false));
+        assert!(sprint1_fail.sync_success(false));
+
+        let sprint1_ok = go(true, 1, 0, 0, 1, 0);
+        assert!(sprint1_ok.success(false));
+        assert!(sprint1_ok.sync_success(true));
+        assert!(!sprint1_ok.sync_success(false));
+    }
+
+    // ---- Phase C: committee_from, parse failures, verify_trace -------------------------------
+
+    #[test]
+    fn committee_from_requires_both_or_neither() {
+        let k = vec![7u8; 48 * 2];
+        let a = [9u8; 48];
+        // neither: an empty committee of the requested size
+        let e = committee_from(&[], &[], 8).unwrap();
+        assert_eq!(e.len, 8);
+        // aggregate alone, or keys alone, is malformed (kills `&&` -> `||`)
+        assert!(committee_from(&[], &a, 8).is_none());
+        assert!(committee_from(&k, &[], 8).is_none());
+        // both present
+        assert_eq!(committee_from(&k, &a, 8).unwrap().len, 2);
+        // wrong lengths
+        assert!(committee_from(&k[..47], &a, 8).is_none());
+        assert!(committee_from(&k, &a[..47], 8).is_none());
+    }
+
+    #[test]
+    fn malformed_signature_is_counted_per_update_and_traced() {
+        let mut i = with_sync(fixture());
+        let good = i.sync.as_ref().unwrap().updates[0].clone();
+        let mut short = good.clone();
+        short.signature.truncate(95);
+        i.sync.as_mut().unwrap().updates = vec![short.clone(), good, short];
+        let t = verify_trace(&i, &Mock);
+        assert_eq!((t.output.sync_validated, t.output.sync_rejected), (1, 2));
+        assert_eq!(
+            t.updates,
+            vec![
+                UpdateOutcome::Malformed,
+                UpdateOutcome::Validated,
+                UpdateOutcome::Malformed
+            ]
+        );
+    }
+
+    #[test]
+    fn verify_trace_reports_a_typed_outcome_per_update() {
+        let mut i = with_sync(fixture());
+        let valid = i.sync.as_ref().unwrap().updates[0].clone();
+        let mut bad_sig = valid.clone();
+        bad_sig.signature[0] ^= 1;
+        let mut low = valid.clone();
+        low.bits = low_bits();
+        let mut old = valid.clone();
+        old.attested.slot = 8;
+        old.finalized = hdr(0, ZERO);
+        old.finality_branch = vec![ZERO; 7];
+        i.sync.as_mut().unwrap().updates = vec![valid, bad_sig, low, old];
+        let t = verify_trace(&i, &Mock);
+        assert_eq!(
+            t.updates,
+            vec![
+                UpdateOutcome::Validated,
+                UpdateOutcome::Rejected(Error::BadSignature),
+                UpdateOutcome::Rejected(Error::BelowThreshold),
+                UpdateOutcome::NotRelevant,
+            ]
+        );
+        let o = &t.output;
+        assert_eq!(
+            (
+                o.sync_validated,
+                o.sync_rejected,
+                o.sync_below_threshold,
+                o.sync_not_relevant
+            ),
+            (1, 2, 1, 1)
+        );
+    }
+
+    #[test]
+    fn verify_trace_output_equals_verify_and_setup_failures_are_typed() {
+        let i = with_sync(fixture());
+        assert_eq!(verify_trace(&i, &Mock).output, verify(&i, &Mock));
+
+        let mut bad_root = with_sync(fixture());
+        bad_root.trusted_root = [0; 32];
+        let t = verify_trace(&bad_root, &Mock);
+        assert_eq!(
+            t.updates,
+            vec![UpdateOutcome::SetupFailed(Error::TrustedRootMismatch)]
+        );
+
+        let mut bad_forks = with_sync(fixture());
+        bad_forks.sync.as_mut().unwrap().forks = vec![];
+        let t = verify_trace(&bad_forks, &Mock);
+        assert_eq!(
+            t.updates,
+            vec![UpdateOutcome::SetupFailed(Error::BadConfig)]
+        );
+        assert!(t.output.bootstrap_ok);
+        assert_eq!(t.output.sync_rejected, 1);
     }
 }

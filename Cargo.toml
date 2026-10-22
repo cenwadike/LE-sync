@@ -1,11 +1,18 @@
 [workspace]
-members = ["core", "wire", "host", "vectors"]
+members = ["core", "wire", "host", "vectors", "testkit"]
 exclude = ["guest"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+# Real pairings in a debug build are very slow, and cargo-mutants derives its test timeout
+# from the baseline run. Optimise the heavy crypto crates even in dev/test profiles.
+[profile.dev.package.bls12_381]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
 
 # NOTE (Logos/LEZ): the RISC Zero guest build pins its own toolchain via the LEZ
 # rust-toolchain.toml and patches `sha2` to the risc0 accelerated fork in the

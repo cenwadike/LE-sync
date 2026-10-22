@@ -1,0 +1,22 @@
+# cargo-mutants configuration. Every exclusion below is an EQUIVALENT or NON-PRODUCTION mutant
+# and must have a matching entry in the design decision log (Supportability #10).
+
+exclude_globs = [
+    "testkit/**",                # test support crate, never shipped, never in the guest
+    "wire/src/bls/blst_impl.rs", # bls-blst impl: panics in the guest today (RUST_MIN_STACK /
+    # sys_getenv), mutually exclusive with bls-zk; not the audited path
+    "vectors/**", # spec-test runner, not product code
+    "guest/**",
+]
+
+exclude_re = [
+    # `cc` only reads a cycle counter under `cycle-trace`; otherwise it is a constant 0 that
+    # nothing branches on. Mutating the constant is unobservable: equivalent.
+    "replace cc -> u64 with",
+    # `log` is a no-op unless `cycle-trace` is on: equivalent.
+    "replace log with \\(\\)",
+]
+
+# Real BLS in tests is slow on a cold build; do not mark slow-but-correct runs as timeouts.
+minimum_test_timeout = 120.0
+timeout_multiplier = 4.0

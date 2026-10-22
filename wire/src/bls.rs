@@ -43,6 +43,11 @@ fn cc() -> u64 {
     }
 }
 
+/// Option B (risc0-patched `blst`) lives in its own file so it can be excluded from mutation
+/// testing as a unit (it is not the audited path and panics in the guest today).
+#[cfg(feature = "bls-blst")]
+mod blst_impl;
+
 /// On-curve decompression only. Subgroup membership comes from the authenticated committee.
 #[cfg(feature = "bls-zk")]
 fn decompress(pk: &BlsPubkey) -> Option<bls12_381::G1Projective> {
@@ -133,50 +138,315 @@ impl Bls for Impl {
     }
 }
 
-/// Option B: risc0-patched `blst`. Ignores `aggregate_pubkey` (blst aggregates internally).
-/// Currently panics in the guest (`RUST_MIN_STACK` / sys_getenv); kept only so the feature builds.
-#[cfg(feature = "bls-blst")]
-impl Bls for Impl {
-    fn fast_aggregate_verify(
-        &self,
-        committee: &[BlsPubkey],
-        _aggregate_pubkey: &BlsPubkey,
+// ---- Direct unit tests for the bls-zk Impl (cargo-mutants: hit every branch) ---------------
+//
+// Two separate `cfg` attributes on purpose: cargo-mutants recognises a bare `#[cfg(test)]`
+// module as test code and does not mutate it; it does not recognise `cfg(all(test, ...))`.
+//
+// Which inputs each path trusts (this is what the `<` / `<=` mutants are killed by):
+//   subtract-absents (absent < present): decompresses `aggregate_pubkey` + every ABSENT key;
+//                                        present keys are never decompressed.
+//   sum-presents (otherwise, incl. an exact tie): decompresses every PRESENT key;
+//                                        `aggregate_pubkey` and absent keys are never touched.
+#[cfg(test)]
+#[cfg(feature = "bls-zk")]
+mod tests {
+    use super::*;
+    use le_sync_testkit as tk;
+
+    const N: usize = 8;
+    const BAD: BlsPubkey = [0xFFu8; 48]; // not a valid compressed G1 point
+
+    fn verify(
+        c: &tk::Committee,
+        pks: &[BlsPubkey],
+        agg: &BlsPubkey,
         bits: &[u8],
         msg: &Bytes32,
         sig: &BlsSignature,
     ) -> bool {
-        use blst::min_pk::{PublicKey, Signature};
-        let t0 = cc();
-        let Ok(sig) = Signature::from_bytes(sig) else {
-            return false;
-        };
-        let mut keys = Vec::new();
-        for (i, k) in committee.iter().enumerate() {
-            if bits[i / 8] >> (i % 8) & 1 == 1 {
-                #[cfg(not(feature = "unchecked-pubkeys"))]
-                let r = PublicKey::key_validate(k);
-                #[cfg(feature = "unchecked-pubkeys")]
-                let r = PublicKey::uncompress(k);
-                match r {
-                    Ok(p) => keys.push(p),
-                    Err(_) => return false,
-                }
-            }
-        }
-        if keys.is_empty() {
-            return false;
-        }
-        let t_keys = cc();
-        let refs: Vec<&PublicKey> = keys.iter().collect();
-        let ok = sig.fast_aggregate_verify(true, msg, DST, &refs) == blst::BLST_ERROR::BLST_SUCCESS;
-        let t_v = cc();
-        trace!(
-            "bls-blst cycles: total={} keys={} key_decode={} fast_aggregate_verify={}",
-            t_v - t0,
-            keys.len(),
-            t_keys - t0,
-            t_v - t_keys
-        );
-        ok
+        let _ = c;
+        Impl.fast_aggregate_verify(pks, agg, bits, msg, sig)
+    }
+
+    /// Honest committee + a valid signature by exactly `bits`.
+    fn signed(seed: u32, bits: &[u8], msg: &Bytes32) -> (tk::Committee, BlsSignature) {
+        let c = tk::committee(seed, N);
+        let sig = c.sign(bits, msg);
+        (c, sig)
+    }
+
+    fn with_key(c: &tk::Committee, i: usize, k: BlsPubkey) -> Vec<BlsPubkey> {
+        let mut p = c.pubkeys.clone();
+        p[i] = k;
+        p
+    }
+
+    #[test]
+    fn dst_matches_the_independent_testkit_constant() {
+        assert_eq!(DST, tk::DST);
+    }
+
+    #[test]
+    fn full_participation_accepts() {
+        let msg = [0x11u8; 32];
+        let bits = tk::bits_set(N, N);
+        let (c, sig) = signed(1, &bits, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &bits, &msg, &sig));
+    }
+
+    #[test]
+    fn scattered_bits_accept_on_both_paths() {
+        let msg = [0x22u8; 32];
+        // 3 present / 5 absent -> sum-presents; non-contiguous so bit-index arithmetic matters
+        let sparse = tk::bits_from(N, &[1, 4, 6]);
+        let (c, sig) = signed(2, &sparse, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &sparse, &msg, &sig));
+        // 7 present / 1 absent -> subtract-absents
+        let dense = tk::bits_from(N, &[0, 1, 2, 4, 5, 6, 7]);
+        let (c, sig) = signed(3, &dense, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &dense, &msg, &sig));
+        // the same signature does not verify for a different selection
+        assert!(!verify(&c, &c.pubkeys, &c.aggregate, &sparse, &msg, &sig));
+    }
+
+    #[test]
+    fn bits_spanning_two_bytes_select_the_right_members() {
+        // 16-member committee, bits straddle the byte boundary (indices 7, 8, 15)
+        let msg = [0x23u8; 32];
+        let c = tk::committee(4, 16);
+        let bits = tk::bits_from(16, &[7, 8, 15]);
+        let sig = c.sign(&bits, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &bits, &msg, &sig));
+        let off_by_one = tk::bits_from(16, &[6, 8, 15]);
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &off_by_one,
+            &msg,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn sum_path_ignores_aggregate_and_absent_keys_but_not_present_keys() {
+        let msg = [0x24u8; 32];
+        let bits = tk::bits_from(N, &[1, 4, 6]); // 3 present, 5 absent
+        let (c, sig) = signed(5, &bits, &msg);
+        // aggregate never decompressed on this path
+        assert!(verify(&c, &c.pubkeys, &BAD, &bits, &msg, &sig));
+        // an ABSENT key is never decompressed
+        assert!(verify(
+            &c,
+            &with_key(&c, 0, BAD),
+            &c.aggregate,
+            &bits,
+            &msg,
+            &sig
+        ));
+        // a PRESENT key must decompress
+        assert!(!verify(
+            &c,
+            &with_key(&c, 4, BAD),
+            &c.aggregate,
+            &bits,
+            &msg,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn exact_tie_takes_the_sum_path() {
+        // 4 present / 4 absent: `absent < present` is false, so sum-presents. A `<=` mutant
+        // would take subtract-absents and reject the garbage aggregate below.
+        let msg = [0x25u8; 32];
+        let bits = tk::bits_from(N, &[0, 2, 4, 6]);
+        let (c, sig) = signed(6, &bits, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &bits, &msg, &sig));
+        assert!(verify(&c, &c.pubkeys, &BAD, &bits, &msg, &sig));
+        assert!(verify(
+            &c,
+            &with_key(&c, 1, BAD),
+            &c.aggregate,
+            &bits,
+            &msg,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn subtract_path_trusts_aggregate_and_absent_keys_not_present_keys() {
+        let msg = [0x26u8; 32];
+        let bits = tk::bits_from(N, &[0, 1, 2, 4, 5, 6, 7]); // 7 present, 1 absent (index 3)
+        let (c, sig) = signed(7, &bits, &msg);
+        // the aggregate must decompress
+        assert!(!verify(&c, &c.pubkeys, &BAD, &bits, &msg, &sig));
+        // the ABSENT key must decompress
+        assert!(!verify(
+            &c,
+            &with_key(&c, 3, BAD),
+            &c.aggregate,
+            &bits,
+            &msg,
+            &sig
+        ));
+        // a PRESENT key is never decompressed here: the aggregate stands in for them. This pins
+        // the documented reliance on `aggregate_pubkey == sum(pubkeys)` being committed.
+        assert!(verify(
+            &c,
+            &with_key(&c, 0, BAD),
+            &c.aggregate,
+            &bits,
+            &msg,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn aggregate_inconsistent_with_keys_is_rejected_on_the_subtract_path() {
+        let msg = [0x27u8; 32];
+        let bits = tk::bits_set(N, N);
+        let (c, sig) = signed(8, &bits, &msg);
+        let wrong_agg = tk::committee(80, N).aggregate;
+        assert!(!verify(&c, &c.pubkeys, &wrong_agg, &bits, &msg, &sig));
+    }
+
+    #[test]
+    fn zero_participants_rejected_before_pairing() {
+        let (c, _) = signed(9, &tk::bits_set(N, N), &[0u8; 32]);
+        let bits = tk::bits_set(N, 0);
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &bits,
+            &[0x44; 32],
+            &[0u8; 96]
+        ));
+    }
+
+    #[test]
+    fn empty_committee_or_bits_length_mismatch_rejected() {
+        let msg = [0x55u8; 32];
+
+        // Empty committee: rejected regardless of signature.
+        assert!(!Impl.fast_aggregate_verify(&[], &[0u8; 48], &[], &msg, &[0u8; 96]));
+
+        // Valid signature by the full committee, so ONLY the length guard can reject below.
+        let bits = tk::bits_set(N, N); // 1 byte for N = 8
+        let (c, sig) = signed(10, &bits, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &bits, &msg, &sig)); // sanity: accepts
+
+        // Too many bytes: first 8 bits are all set, so without the guard this would verify.
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &[0xFF, 0xFF],
+            &msg,
+            &sig
+        ));
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &[0xFF, 0x00],
+            &msg,
+            &sig
+        ));
+
+        // Too few bytes (16-member committee, 1-byte bitfield). Valid signature by members 0..8.
+        let c16 = tk::committee(14, 16);
+        let bits16 = tk::bits_from(16, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let sig16 = c16.sign(&bits16, &msg);
+        assert!(verify(
+            &c16,
+            &c16.pubkeys,
+            &c16.aggregate,
+            &bits16,
+            &msg,
+            &sig16
+        )); // sanity
+        assert!(!verify(
+            &c16,
+            &c16.pubkeys,
+            &c16.aggregate,
+            &bits16[..1],
+            &msg,
+            &sig16
+        ));
+    }
+
+    #[test]
+    fn infinity_and_garbage_signatures_rejected() {
+        let msg = [0x66u8; 32];
+        let bits = tk::bits_set(N, N);
+        let c = tk::committee(11, N);
+        // all-zero bytes: compression flag unset, not a valid encoding
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &bits,
+            &msg,
+            &[0u8; 96]
+        ));
+        // the real encoding of the point at infinity is a valid G2 element but proves nothing
+        let mut infinity = [0u8; 96];
+        infinity[0] = 0xC0;
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &bits,
+            &msg,
+            &infinity
+        ));
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &bits,
+            &msg,
+            &[0xFFu8; 96]
+        ));
+    }
+
+    #[test]
+    fn wrong_message_and_wrong_keys_rejected() {
+        let msg = [0xAAu8; 32];
+        let bits = tk::bits_set(N, N);
+        let (c, sig) = signed(12, &bits, &msg);
+        assert!(!verify(
+            &c,
+            &c.pubkeys,
+            &c.aggregate,
+            &bits,
+            &[0xBB; 32],
+            &sig
+        ));
+        // A wholly different committee (keys AND its matching aggregate) must not verify.
+        // Passing `c.aggregate` here would not work: on the subtract path the aggregate stands
+        // in for all present keys, so `other.pubkeys` would never be consulted.
+        let other = tk::committee(99, N);
+        assert!(!verify(
+            &c,
+            &other.pubkeys,
+            &other.aggregate,
+            &bits,
+            &msg,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn single_flipped_signature_bit_is_rejected() {
+        let msg = [0xCCu8; 32];
+        let bits = tk::bits_set(N, N);
+        let (c, mut sig) = signed(13, &bits, &msg);
+        assert!(verify(&c, &c.pubkeys, &c.aggregate, &bits, &msg, &sig));
+        sig[95] ^= 1;
+        assert!(!verify(&c, &c.pubkeys, &c.aggregate, &bits, &msg, &sig));
     }
 }
