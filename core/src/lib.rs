@@ -1,7 +1,7 @@
 //! `le-sync-core`: `no_std`, allocation-free Ethereum light-client primitives.
 //!
-//! Scope (Sprint 1+2): SSZ Merkle-branch verification as the consensus specs define it,
-//! with the light-client generalized indices selected per fork.
+//! Scope (Sprint 4): execution-layer state proofs: `ExecutionPayloadHeader` root (`exec`),
+//! strict RLP (`rlp`), Merkle-Patricia proofs (`mpt`), account + storage lookups (`state`).
 //!
 //! Spec map (all from `ethereum/consensus-specs`):
 //! * `phase0/beacon-chain.md`            `is_valid_merkle_branch`
@@ -18,6 +18,16 @@
 
 use sha2::{Digest, Sha256};
 
+// Lets `testkit/src/trie.rs`, which names this crate `le_sync_core`, also compile as a module of
+// this crate's own tests (see `mpt::testutil`).
+#[cfg(test)]
+extern crate self as le_sync_core;
+
+pub mod exec;
+pub mod keccak;
+pub mod mpt;
+pub mod rlp;
+pub mod state;
 pub mod sync;
 
 pub type Bytes32 = [u8; 32];
@@ -50,6 +60,12 @@ pub enum Error {
     BadSyncCommitteeSize,
     /// Finalized header at genesis slot must be the empty header.
     GenesisFinalizedHeaderNotEmpty,
+    /// RLP is malformed or not canonical (Sprint 4). Also: a decoded account / storage value
+    /// has the wrong shape (bad arity, leading zeros, wrong hash length).
+    InvalidRlp,
+    /// A Merkle-Patricia proof does not verify under the given root: hash mismatch, missing or
+    /// surplus nodes, bad hex-prefix path, or malformed node structure (Sprint 4).
+    InvalidTrieProof,
     CommitteeSizeMismatch,
     InsufficientParticipants,
     BadSlotOrder,
@@ -80,13 +96,15 @@ pub type ErrorCode = u16;
 impl Error {
     /// Every variant, for coverage tests. Keep in sync with the enum; `code()` and
     /// `message()` are exhaustive matches, so a new variant fails to compile until it has both.
-    pub const ALL: [Error; 18] = [
+    pub const ALL: [Error; 20] = [
         Error::BadConfig,
         Error::UnsupportedFork,
         Error::BadSyncCommitteeSize,
         Error::TrustedRootMismatch,
         Error::InvalidBranch,
         Error::GenesisFinalizedHeaderNotEmpty,
+        Error::InvalidRlp,
+        Error::InvalidTrieProof,
         Error::CommitteeSizeMismatch,
         Error::InsufficientParticipants,
         Error::BadSlotOrder,
@@ -111,6 +129,8 @@ impl Error {
             Error::TrustedRootMismatch => 200,
             Error::InvalidBranch => 201,
             Error::GenesisFinalizedHeaderNotEmpty => 202,
+            Error::InvalidRlp => 203,
+            Error::InvalidTrieProof => 204,
             Error::CommitteeSizeMismatch => 300,
             Error::InsufficientParticipants => 301,
             Error::BadSlotOrder => 302,
@@ -135,6 +155,8 @@ impl Error {
             Error::TrustedRootMismatch => "bootstrap header does not hash to the trusted block root; obtain the bootstrap for the configured checkpoint or re-check the checkpoint",
             Error::InvalidBranch => "Merkle branch does not prove the claimed value under the given state root; the update or bootstrap data is corrupt or forged",
             Error::GenesisFinalizedHeaderNotEmpty => "finalized header at the genesis slot must be the empty header",
+            Error::InvalidRlp => "RLP data is malformed or not canonically encoded, or a decoded account/storage value has the wrong shape; the proof payload is corrupt or forged",
+            Error::InvalidTrieProof => "Merkle-Patricia proof does not verify under the given root (hash mismatch, missing or surplus node, or malformed path); the account/storage proof is corrupt, forged, or for another state",
             Error::CommitteeSizeMismatch => "participation bitfield or next committee size does not match the current sync committee",
             Error::InsufficientParticipants => "update has no sync committee participants",
             Error::BadSlotOrder => "slots must satisfy current >= signature > attested >= finalized",
@@ -286,8 +308,9 @@ pub fn sync_committee_root(
     for (i, pk) in pubkeys.iter().enumerate() {
         buf[i] = pubkey_root(pk);
     }
+    // `n` is a power of two (checked above): log2(n) halving passes.
     let mut len = n;
-    while len > 1 {
+    for _ in 0..n.trailing_zeros() {
         for i in 0..len / 2 {
             buf[i] = hash_pair(&buf[2 * i], &buf[2 * i + 1]);
         }
@@ -859,13 +882,15 @@ mod tests {
     #[test]
     fn error_code_numbering_is_pinned() {
         // Changing any of these is a breaking change to the public error contract.
-        let pinned: [(Error, ErrorCode); 18] = [
+        let pinned: [(Error, ErrorCode); 20] = [
             (Error::BadConfig, 100),
             (Error::UnsupportedFork, 101),
             (Error::BadSyncCommitteeSize, 102),
             (Error::TrustedRootMismatch, 200),
             (Error::InvalidBranch, 201),
             (Error::GenesisFinalizedHeaderNotEmpty, 202),
+            (Error::InvalidRlp, 203),
+            (Error::InvalidTrieProof, 204),
             (Error::CommitteeSizeMismatch, 300),
             (Error::InsufficientParticipants, 301),
             (Error::BadSlotOrder, 302),

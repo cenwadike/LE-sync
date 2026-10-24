@@ -1,4 +1,4 @@
-//! Host side of LE-Sync Sprint 1: fetch `bootstrap` / `updates` / `finality_update` from a
+//! Host side of LE-Sync Sprints 1-4 (Sprint 4: `eth_getProof` account/storage proofs): fetch `bootstrap` / `updates` / `finality_update` from a
 //! beacon API (or a saved directory of the same JSON) and verify the SSZ Merkle branches with
 //! `le-sync-core`.
 //!
@@ -15,14 +15,14 @@
 //! Everything with logic in it lives here (argument parsing, endpoint building, slot and period
 //! arithmetic, exit-code mapping) so it is unit-testable; `main.rs` is only I/O glue.
 
-use le_sync_core::sync::ChainBinding;
+use le_sync_core::sync::{has_supermajority, ChainBinding};
 use le_sync_core::{
     is_branch_present, verify_bootstrap, verify_finality_branch, BeaconBlockHeader, Bytes32,
     ChainConfig, Error,
 };
 use le_sync_wire::{
-    build_chain_binding, check_chain_binding, FinalityItem, GuestInput, GuestOutput, SyncInput,
-    UpdateWire, WireHeader,
+    build_chain_binding, check_chain_binding, ExecWire, FinalityItem, GuestInput, GuestOutput,
+    StateInput, SyncInput, UpdateWire, WireHeader,
 };
 use serde_json::Value;
 use std::{fs, path::PathBuf};
@@ -45,6 +45,8 @@ USAGE:
   le-sync --source <URL|DIR> --trusted-root <0x..> [--count N] [--save-dir DIR]
           [--tamper] [--sync] [--tamper-sig] [--other-chain] [--cross-config DIR]
           [--latest-only]
+          [--address 0x.. [--slot 0x..] --execution-rpc <URL|DIR>]
+          [--expect-value 0x..] [--expect-balance 0x..] [--tamper-state] [--tamper-exec]
 
   --source        beacon API base URL (e.g. https://<host>) or a directory of saved JSON
                   (config_spec.json, bootstrap.json, updates.json, finality_update.json, genesis.json)
@@ -62,6 +64,18 @@ USAGE:
                   while updates, bootstrap and clock stay from --source; implies --sync. Guest
                   must reject AND the chain binding check must report a mismatch (exit 0 if both)
   --latest-only   with --sync: send the guest only the newest finality_update (cost isolation)
+  --address       Ethereum account to prove under the finalized execution state root (20 bytes);
+                  implies --sync. The guest derives the state root itself from the finalized
+                  header; nothing the RPC says about roots is trusted
+  --slot          storage slot to prove (up to 32 bytes, default 0x0)
+  --execution-rpc JSON-RPC URL serving eth_getProof, or a directory holding state_proof.json
+                  (the saved response of a previous run: offline re-runs). Needed with --address
+  --expect-value  with --address: the journal's slot value must equal this (hex, left-padded)
+  --expect-balance with --address: the journal's account balance must equal this (hex wei)
+  --tamper-state  with --address: flip one bit of the first account-proof node; the guest must
+                  reject with the trie-proof error (204) (exit 0 if so)
+  --tamper-exec   with --address: flip one bit of the execution header's state root; the guest
+                  must reject with the branch error (201) (exit 0 if so). Wins over --tamper-state
 
 EXIT CODES:
   0  OK
@@ -89,12 +103,41 @@ pub struct Opts {
     /// `--source`. The guest must reject (signing domain) and the consumer chain check must
     /// report a mismatch against the host's own (`--source`) chain.
     pub cross_config: Option<PathBuf>,
+    /// Sprint 4: account + storage proof section. `StateOpts::default()` = none.
+    pub state: StateOpts,
+}
+
+/// Sprint 4 options. `address` switches the state section on; everything else refines it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateOpts {
+    pub address: Option<[u8; 20]>,
+    /// `None` = slot 0 (the proof is still fetched; use `--expect-balance` for balance-only runs).
+    pub slot: Option<Bytes32>,
+    /// JSON-RPC URL (`eth_getProof`) or a directory containing `state_proof.json`.
+    pub execution_rpc: Option<String>,
+    pub expect_value: Option<Bytes32>,
+    pub expect_balance: Option<Bytes32>,
+    /// Flip a bit in the first account-proof node: the guest must answer `InvalidTrieProof`.
+    pub tamper_state: bool,
+    /// Flip a bit in the execution header's `state_root`: the guest must answer `InvalidBranch`.
+    /// Takes precedence over `tamper_state` (the anchor is checked first).
+    pub tamper_exec: bool,
+}
+
+impl StateOpts {
+    pub fn requested(&self) -> bool {
+        self.address.is_some()
+    }
 }
 
 impl Opts {
     /// Runs that need the guest's sync section.
     pub fn wants_sync(&self) -> bool {
-        self.sync || self.tamper_sig || self.other_chain || self.cross_config.is_some()
+        self.sync
+            || self.tamper_sig
+            || self.other_chain
+            || self.cross_config.is_some()
+            || self.state.requested()
     }
 
     /// Runs built to present a different chain than the host's own: the journal's chain binding
@@ -116,6 +159,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
     let (mut source, mut root, mut count, mut save, mut tamper) = (None, None, 1u64, None, false);
     let (mut sync, mut tamper_sig, mut other_chain, mut latest_only) = (false, false, false, false);
     let mut cross_config: Option<PathBuf> = None;
+    let mut st = StateOpts::default();
     while let Some(k) = a.next() {
         let mut val = |name: &str| a.next().ok_or_else(|| format!("{name} needs a value"));
         match k.as_str() {
@@ -133,9 +177,47 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
             "--other-chain" => other_chain = true,
             "--cross-config" => cross_config = Some(PathBuf::from(val("--cross-config")?)),
             "--latest-only" => latest_only = true,
+            "--address" => {
+                st.address =
+                    Some(parse_address(&val("--address")?).map_err(|e| format!("--address: {e}"))?)
+            }
+            "--slot" => {
+                st.slot = Some(parse_word(&val("--slot")?).map_err(|e| format!("--slot: {e}"))?)
+            }
+            "--execution-rpc" => st.execution_rpc = Some(val("--execution-rpc")?),
+            "--expect-value" => {
+                st.expect_value = Some(
+                    parse_word(&val("--expect-value")?)
+                        .map_err(|e| format!("--expect-value: {e}"))?,
+                )
+            }
+            "--expect-balance" => {
+                st.expect_balance = Some(
+                    parse_word(&val("--expect-balance")?)
+                        .map_err(|e| format!("--expect-balance: {e}"))?,
+                )
+            }
+            "--tamper-state" => st.tamper_state = true,
+            "--tamper-exec" => st.tamper_exec = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+    if st.address.is_none() {
+        if st.slot.is_some()
+            || st.execution_rpc.is_some()
+            || st.expect_value.is_some()
+            || st.expect_balance.is_some()
+            || st.tamper_state
+            || st.tamper_exec
+        {
+            return Err("--slot, --execution-rpc, --expect-value, --expect-balance, --tamper-state and --tamper-exec need --address".into());
+        }
+    } else if st.execution_rpc.is_none() {
+        return Err(
+            "--address needs --execution-rpc (a JSON-RPC URL or a directory with state_proof.json)"
+                .into(),
+        );
     }
     let root_s = root.ok_or("--trusted-root is required")?;
     let raw = hex::decode(root_s.strip_prefix("0x").unwrap_or(&root_s))
@@ -154,6 +236,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
         other_chain,
         latest_only,
         cross_config,
+        state: st,
     })
 }
 
@@ -290,6 +373,219 @@ fn flip_last(branch: &mut [Bytes32]) {
     if let Some(last) = branch.last_mut() {
         last[0] ^= 0x01;
     }
+}
+
+// ---- Sprint 4: account + storage state proof ---------------------------------------------------
+
+// BEGIN pure helpers (no serde_json: unit-tested in isolation too)
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let t = s.strip_prefix("0x").unwrap_or(s);
+    let padded = if t.len() % 2 == 1 {
+        format!("0{t}")
+    } else {
+        t.to_string()
+    };
+    hex::decode(padded).map_err(|e| e.to_string())
+}
+
+/// 20-byte Ethereum address, `0x` optional.
+pub fn parse_address(s: &str) -> Result<[u8; 20], String> {
+    let raw = hex::decode(s.strip_prefix("0x").unwrap_or(s)).map_err(|e| e.to_string())?;
+    raw.try_into()
+        .map_err(|_| "must be exactly 20 bytes".to_string())
+}
+
+/// Up to 32 bytes of hex (odd length allowed), left-padded to a big-endian 32-byte word.
+pub fn parse_word(s: &str) -> Result<Bytes32, String> {
+    let raw = parse_hex_bytes(s)?;
+    if raw.len() > 32 {
+        return Err("must be at most 32 bytes".into());
+    }
+    let mut out = [0u8; 32];
+    out[32 - raw.len()..].copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// Decimal string -> 32-byte little-endian uint256 (the SSZ encoding of `base_fee_per_gas`).
+pub fn dec_u256_le(s: &str) -> Result<Bytes32, String> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("`{s}` is not a decimal integer"));
+    }
+    let mut out = [0u8; 32];
+    for digit in s.bytes().map(|b| (b - b'0') as u32) {
+        let mut carry = digit;
+        for byte in out.iter_mut() {
+            let v = (*byte as u32) * 10 + carry;
+            *byte = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        if carry != 0 {
+            return Err(format!("`{s}` overflows uint256"));
+        }
+    }
+    Ok(out)
+}
+
+/// The JSON-RPC body that asks for one account and one storage slot at `block`.
+pub fn state_proof_request(address: &[u8; 20], slot: &Bytes32, block: u64) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getProof","params":["0x{}",["0x{}"],"0x{:x}"]}}"#,
+        hex::encode(address),
+        hex::encode(slot),
+        block
+    )
+}
+
+/// Flip one bit of the first byte of the first node (the RLP list header): the node no longer
+/// hashes to what its parent (or the state root) commits to.
+pub fn flip_first_node(nodes: &mut [Vec<u8>]) {
+    if let Some(b) = nodes.first_mut().and_then(|n| n.first_mut()) {
+        *b ^= 1;
+    }
+}
+
+// END pure helpers
+
+/// A finalized header's execution payload header and the `execution_branch` that ties it to the
+/// header's `body_root`, taken from an update the guest's strict gate will not reject.
+#[derive(Clone, Debug)]
+struct Anchor {
+    slot: u64,
+    exec: ExecWire,
+    branch: Vec<Bytes32>,
+}
+
+fn as_u256_le(v: &Value, k: &str) -> Result<Bytes32, String> {
+    let f = field(v, k)?;
+    match f.as_str() {
+        Some(s) => dec_u256_le(s).map_err(|e| format!("`{k}`: {e}")),
+        None => match f.as_u64() {
+            Some(n) => dec_u256_le(&n.to_string()).map_err(|e| format!("`{k}`: {e}")),
+            None => Err(format!("`{k}`: not a decimal integer")),
+        },
+    }
+}
+
+/// `finalized_header.execution` of a light-client update (Deneb layout, 17 fields).
+fn exec_wire(v: &Value) -> Result<ExecWire, String> {
+    Ok(ExecWire {
+        parent_hash: hex_field::<32>(v, "parent_hash")?,
+        fee_recipient: hex_field::<20>(v, "fee_recipient")?,
+        state_root: hex_field::<32>(v, "state_root")?,
+        receipts_root: hex_field::<32>(v, "receipts_root")?,
+        logs_bloom: hex_vec(v, "logs_bloom")?,
+        prev_randao: hex_field::<32>(v, "prev_randao")?,
+        block_number: as_u64(v, "block_number")?,
+        gas_limit: as_u64(v, "gas_limit")?,
+        gas_used: as_u64(v, "gas_used")?,
+        timestamp: as_u64(v, "timestamp")?,
+        extra_data: hex_vec(v, "extra_data")?,
+        base_fee_per_gas: as_u256_le(v, "base_fee_per_gas")?,
+        block_hash: hex_field::<32>(v, "block_hash")?,
+        transactions_root: hex_field::<32>(v, "transactions_root")?,
+        withdrawals_root: hex_field::<32>(v, "withdrawals_root")?,
+        blob_gas_used: as_u64(v, "blob_gas_used")?,
+        excess_blob_gas: as_u64(v, "excess_blob_gas")?,
+    })
+}
+
+/// The anchor candidate of one update object, or `None` if it cannot move the guest's store:
+/// no finality branch (no finalized header), no `execution` data, or participation below 2/3
+/// (mirrors the guest's strict gate, `wire::process_update_strict`).
+fn anchor_of(obj: &Value) -> Result<Option<Anchor>, String> {
+    if !is_branch_present(&hex_array::<32>(obj, "finality_branch")?) {
+        return Ok(None);
+    }
+    let fin = field(obj, "finalized_header")?;
+    let (Some(exec), Some(_)) = (fin.get("execution"), fin.get("execution_branch")) else {
+        return Ok(None);
+    };
+    let bits = match obj.get("sync_aggregate") {
+        Some(a) => hex_vec(a, "sync_committee_bits")?,
+        None => vec![],
+    };
+    if !has_supermajority(&bits) {
+        return Ok(None);
+    }
+    Ok(Some(Anchor {
+        slot: beacon_header(fin)?.slot,
+        exec: exec_wire(exec)?,
+        branch: hex_array::<32>(fin, "execution_branch")?,
+    }))
+}
+
+/// The newest finalized header among the candidates: the one the guest's store ends on if every
+/// candidate validates. If the guest ends elsewhere (a bad signature, say) the anchor simply
+/// fails to verify there: the guest, not this choice, decides.
+fn pick_anchor(c: Vec<Anchor>) -> Option<Anchor> {
+    c.into_iter().max_by_key(|a| a.slot)
+}
+
+/// `eth_getProof` response (full JSON-RPC envelope or just the result) from the JSON-RPC
+/// endpoint, or from `<dir>/state_proof.json`; saved to `--save-dir` as `state_proof.json`.
+fn fetch_state_proof(
+    rpc: &str,
+    save_dir: Option<&PathBuf>,
+    address: &[u8; 20],
+    slot: &Bytes32,
+    block: u64,
+) -> Result<Value, String> {
+    let bytes: Vec<u8> = if rpc.starts_with("http://") || rpc.starts_with("https://") {
+        let resp = ureq::post(rpc)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_string(&state_proof_request(address, slot, block))
+            .map_err(|e| format!("POST {rpc} eth_getProof: {e}"))?;
+        resp.into_string()
+            .map_err(|e| format!("read body of {rpc}: {e}"))?
+            .into_bytes()
+    } else {
+        let p = PathBuf::from(rpc).join("state_proof.json");
+        fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?
+    };
+    if let Some(dir) = save_dir {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        fs::write(dir.join("state_proof.json"), &bytes)
+            .map_err(|e| format!("save state_proof.json: {e}"))?;
+    }
+    let v = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|e| format!("state_proof.json: bad JSON: {e}"))?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("eth_getProof failed: {err}"));
+    }
+    Ok(v)
+}
+
+/// `(accountProof, storageProof[0].proof)` as raw RLP nodes. The response's own `balance`,
+/// `storageHash`, `value` etc. are ignored: only the proof nodes are used, and the guest checks
+/// them against roots it derived itself.
+pub fn parse_state_proof(v: &Value) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), String> {
+    let r = v.get("result").unwrap_or(v);
+    let nodes = |a: &Value, what: &str| -> Result<Vec<Vec<u8>>, String> {
+        a.as_array()
+            .ok_or_else(|| format!("{what}: not an array"))?
+            .iter()
+            .map(|e| {
+                e.as_str()
+                    .ok_or_else(|| format!("{what}: element not a string"))
+                    .and_then(|s| {
+                        hex::decode(s.strip_prefix("0x").unwrap_or(s))
+                            .map_err(|e| format!("{what}: {e}"))
+                    })
+            })
+            .collect()
+    };
+    let account = nodes(field(r, "accountProof")?, "accountProof")?;
+    let storage = match r
+        .get("storageProof")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+    {
+        Some(sp) => nodes(field(sp, "proof")?, "storageProof[0].proof")?,
+        None => vec![],
+    };
+    Ok((account, storage))
 }
 
 // ---- pure helpers (unit-tested directly; a directory source ignores endpoints) -----------------
@@ -575,6 +871,8 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
         .or_else(|| top.get("data").and_then(|d| d.as_array()))
         .ok_or("updates: expected a JSON array")?;
     let want_sync = o.wants_sync();
+    let want_state = o.state.requested();
+    let mut anchors: Vec<Anchor> = vec![];
     let mut finality = vec![];
     let mut updates = vec![];
     for item in items {
@@ -587,6 +885,9 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
         if want_sync {
             updates.push(update_wire(data(item), o)?);
         }
+        if want_state {
+            anchors.extend(anchor_of(data(item))?);
+        }
     }
     let top = src.get(
         "/eth/v1/beacon/light_client/finality_update",
@@ -596,6 +897,9 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
     finality.push(finality_item(data(&top), o.tamper)?);
     if want_sync {
         updates.push(update_wire(data(&top), o)?);
+    }
+    if want_state {
+        anchors.extend(anchor_of(data(&top))?);
     }
     let (sync, expected) = if want_sync {
         // The host's own chain: source of the expected binding and of the clock.
@@ -642,6 +946,47 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
         (None, None)
     };
 
+    let state = match o.state.address {
+        None => None,
+        Some(address) => {
+            let anchor = pick_anchor(anchors).ok_or(
+                "no update with a finalized execution header and >= 2/3 sync participation was \
+                 fetched; retry shortly, or run without --latest-only",
+            )?;
+            let rpc = o
+                .state
+                .execution_rpc
+                .as_deref()
+                .ok_or("--address needs --execution-rpc")?;
+            let slot = o.state.slot.unwrap_or([0u8; 32]);
+            // The block comes from the (still unverified) header; the guest proves it, and a proof
+            // fetched for any other block fails against the state root the guest derives.
+            let proof = fetch_state_proof(
+                rpc,
+                o.save_dir.as_ref(),
+                &address,
+                &slot,
+                anchor.exec.block_number,
+            )?;
+            let (mut account_proof, storage_proof) = parse_state_proof(&proof)?;
+            let mut exec = anchor.exec;
+            if o.state.tamper_state {
+                flip_first_node(&mut account_proof);
+            }
+            if o.state.tamper_exec {
+                exec.state_root[0] ^= 1;
+            }
+            Some(StateInput {
+                exec,
+                exec_branch: anchor.branch,
+                address,
+                slot,
+                account_proof,
+                storage_proof,
+            })
+        }
+    };
+
     let input = GuestInput {
         slots_per_epoch: p.cfg.slots_per_epoch,
         electra_fork_epoch: p.cfg.electra_fork_epoch,
@@ -653,6 +998,7 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
         boot_branch,
         finality,
         sync,
+        state,
     };
     Ok(Collected { input, expected })
 }
@@ -667,6 +1013,10 @@ pub enum Verdict {
     /// binding matched the host's own chain: the consumer check failed to notice.
     ChainMismatchNotDetected,
     TrustedRootDiffers,
+    /// Sprint 1-3 checks passed but the committed state section is not what was asked for
+    /// (rejected, wrong address/slot, wrong expected value/balance, or a tamper run whose
+    /// rejection was not the expected typed error).
+    StateNotOk,
     NotOk,
 }
 
@@ -675,7 +1025,10 @@ pub fn verdict_exit_code(v: &Verdict) -> u8 {
     match v {
         Verdict::Ok => 0,
         Verdict::ChainMismatch(_) => 3,
-        Verdict::ChainMismatchNotDetected | Verdict::TrustedRootDiffers | Verdict::NotOk => 1,
+        Verdict::ChainMismatchNotDetected
+        | Verdict::TrustedRootDiffers
+        | Verdict::StateNotOk
+        | Verdict::NotOk => 1,
     }
 }
 
@@ -694,10 +1047,39 @@ pub fn judge(o: &Opts, out: &GuestOutput, expected: Option<&ChainBinding>) -> Ve
     // tamper-sig / other-chain / cross-config leave Sprint 1 checks untouched: they must pass.
     let sync_ok = !o.wants_sync() || out.sync_success(o.expects_sync_reject());
     if out.success(o.tamper) && sync_ok {
-        Verdict::Ok
+        if state_ok_for(o, out) {
+            Verdict::Ok
+        } else {
+            Verdict::StateNotOk
+        }
     } else {
         Verdict::NotOk
     }
+}
+
+/// Sprint 4 judgement, on the journal only. Without `--address` there is nothing to judge.
+/// Tamper runs must be rejected by the guest with the specific typed error (the anchor is
+/// checked first, so `--tamper-exec` wins over `--tamper-state`).
+fn state_ok_for(o: &Opts, out: &GuestOutput) -> bool {
+    let st = &o.state;
+    let Some(address) = st.address else {
+        return true;
+    };
+    let rejected_with =
+        |e: Error| out.state_checked && !out.state_ok && out.state_error_code == e.code();
+    if st.tamper_exec {
+        return rejected_with(Error::InvalidBranch);
+    }
+    if st.tamper_state {
+        return rejected_with(Error::InvalidTrieProof);
+    }
+    out.state_checked
+        && out.state_ok
+        && out.state_error_code == 0
+        && out.state_address == address
+        && out.state_slot == st.slot.unwrap_or([0u8; 32])
+        && st.expect_value.map_or(true, |v| out.state_value == v)
+        && st.expect_balance.map_or(true, |b| out.account_balance == b)
 }
 
 #[cfg(test)]
@@ -868,6 +1250,7 @@ mod tests {
             other_chain: false,
             latest_only: false,
             cross_config: None,
+            state: StateOpts::default(),
         }
     }
 
@@ -1311,6 +1694,7 @@ mod tests {
             other_chain: false,
             latest_only: false,
             cross_config: None,
+            state: StateOpts::default(),
         };
         let u = update_wire(
             &serde_json::from_slice::<Value>(fin.as_bytes()).unwrap(),
@@ -1743,6 +2127,7 @@ mod tests {
             other_chain: false,
             latest_only: false,
             cross_config: None,
+            state: StateOpts::default(),
         };
 
         assert_eq!(update_wire(&valid, &base).unwrap().finality_branch, orig);
@@ -1787,6 +2172,7 @@ mod tests {
             other_chain: false,
             latest_only: false,
             cross_config: None,
+            state: StateOpts::default(),
         };
         assert!(update_wire(&valid, &o).unwrap().signature.is_empty());
     }
@@ -1876,5 +2262,549 @@ mod tests {
         assert_eq!(verdict_exit_code(&Verdict::TrustedRootDiffers), 1);
         assert_eq!(verdict_exit_code(&Verdict::NotOk), 1);
         assert!(USAGE.contains("3  CHAIN MISMATCH"));
+    }
+
+    // ==== Sprint 4: account + storage state proof ================================================
+
+    fn word(n: u8) -> Bytes32 {
+        let mut w = [0u8; 32];
+        w[31] = n;
+        w
+    }
+
+    fn exec_json() -> Value {
+        serde_json::json!({
+            "parent_hash": x(&[1u8; 32]),
+            "fee_recipient": x(&[2u8; 20]),
+            "state_root": x(&[3u8; 32]),
+            "receipts_root": x(&[4u8; 32]),
+            "logs_bloom": x(&[5u8; 256]),
+            "prev_randao": x(&[6u8; 32]),
+            "block_number": "24000123",
+            "gas_limit": "36000000",
+            "gas_used": "777",
+            "timestamp": "1700000000",
+            "extra_data": "0x6c6521",
+            "base_fee_per_gas": "256",
+            "block_hash": x(&[7u8; 32]),
+            "transactions_root": x(&[8u8; 32]),
+            "withdrawals_root": x(&[9u8; 32]),
+            "blob_gas_used": "0",
+            "excess_blob_gas": "0"
+        })
+    }
+
+    fn fin_obj(slot: u64, with_exec: bool) -> Value {
+        let h = BeaconBlockHeader {
+            slot,
+            proposer_index: 1,
+            parent_root: leaf(1),
+            state_root: leaf(2),
+            body_root: leaf(3),
+        };
+        let mut v: Value = serde_json::from_str(&hdr_json(&h)).unwrap();
+        if with_exec {
+            v["execution"] = exec_json();
+            v["execution_branch"] = serde_json::json!(vec![x(&leaf(9)); 4]);
+        }
+        v
+    }
+
+    fn upd_obj(slot: u64, bits: &str, branch_present: bool, with_exec: bool) -> Value {
+        let node = if branch_present { leaf(1) } else { [0u8; 32] };
+        serde_json::json!({
+            "finalized_header": fin_obj(slot, with_exec),
+            "finality_branch": vec![x(&node); 7],
+            "sync_aggregate": { "sync_committee_bits": bits, "sync_committee_signature": "0x" }
+        })
+    }
+
+    #[test]
+    fn exec_wire_parses_the_beacon_api_shape() {
+        let e = exec_wire(&exec_json()).unwrap();
+        assert_eq!(e.block_number, 24_000_123);
+        assert_eq!(
+            (e.gas_limit, e.gas_used, e.timestamp),
+            (36_000_000, 777, 1_700_000_000)
+        );
+        assert_eq!(e.fee_recipient, [2u8; 20]);
+        assert_eq!(e.state_root, [3u8; 32]);
+        assert_eq!(e.logs_bloom.len(), 256);
+        assert_eq!(e.extra_data, b"le!".to_vec());
+        assert_eq!(e.block_hash, [7u8; 32]);
+        assert_eq!((e.blob_gas_used, e.excess_blob_gas), (0, 0));
+        let mut fee = [0u8; 32];
+        fee[1] = 1; // 256, little-endian
+        assert_eq!(e.base_fee_per_gas, fee);
+
+        // a JSON number is accepted for the base fee
+        let mut j = exec_json();
+        j["base_fee_per_gas"] = 7.into();
+        assert_eq!(exec_wire(&j).unwrap().base_fee_per_gas[0], 7);
+
+        // missing field and wrong-length hash are clear errors naming the field
+        let mut j = exec_json();
+        j.as_object_mut().unwrap().remove("blob_gas_used");
+        assert!(exec_wire(&j).unwrap_err().contains("blob_gas_used"));
+        let mut j = exec_json();
+        j["state_root"] = "0x1234".into();
+        assert!(exec_wire(&j).unwrap_err().contains("state_root"));
+        let mut j = exec_json();
+        j["base_fee_per_gas"] = "abc".into();
+        assert!(exec_wire(&j).unwrap_err().contains("base_fee_per_gas"));
+    }
+
+    #[test]
+    fn anchor_of_only_offers_updates_the_guest_can_apply() {
+        let a = anchor_of(&upd_obj(704, "0xffff", true, true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.slot, 704);
+        assert_eq!(a.exec.block_number, 24_000_123);
+        assert_eq!(a.branch.len(), 4);
+        // participation: 16 bits, 2/3 needs 11 set (11 * 3 >= 32), 10 does not
+        assert!(anchor_of(&upd_obj(704, "0xff07", true, true))
+            .unwrap()
+            .is_some());
+        assert!(anchor_of(&upd_obj(704, "0xff03", true, true))
+            .unwrap()
+            .is_none());
+        assert!(anchor_of(&upd_obj(704, "0x0001", true, true))
+            .unwrap()
+            .is_none());
+        assert!(anchor_of(&upd_obj(704, "0x", true, true))
+            .unwrap()
+            .is_none());
+        // no finality branch, or no execution data: nothing to anchor to
+        assert!(anchor_of(&upd_obj(704, "0xffff", false, true))
+            .unwrap()
+            .is_none());
+        assert!(anchor_of(&upd_obj(704, "0xffff", true, false))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pick_anchor_takes_the_newest_finalized_slot() {
+        let e = exec_wire(&exec_json()).unwrap();
+        let mk = |slot| Anchor {
+            slot,
+            exec: e.clone(),
+            branch: vec![],
+        };
+        assert_eq!(pick_anchor(vec![mk(5), mk(9), mk(7)]).unwrap().slot, 9);
+        assert_eq!(pick_anchor(vec![mk(9), mk(5)]).unwrap().slot, 9);
+        assert!(pick_anchor(vec![]).is_none());
+    }
+
+    #[test]
+    fn parse_state_proof_reads_nodes_and_ignores_the_responses_own_claims() {
+        let full = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{
+            "accountProof": ["0x01", "0xabcd"],
+            "balance": "0xdeadbeef", "storageHash": x(&[9u8; 32]),
+            "storageProof": [{"key": "0x0", "value": "0x5", "proof": ["0xc0", "0x80"]}]
+        }});
+        let want = (
+            vec![vec![1u8], vec![0xab, 0xcd]],
+            vec![vec![0xc0u8], vec![0x80]],
+        );
+        assert_eq!(parse_state_proof(&full).unwrap(), want);
+        // the bare result object (no JSON-RPC envelope) works too
+        assert_eq!(parse_state_proof(&full["result"]).unwrap(), want);
+        // an absent account / empty storage proof list
+        let none = serde_json::json!({"result":{"accountProof":["0x01"],"storageProof":[]}});
+        assert_eq!(parse_state_proof(&none).unwrap(), (vec![vec![1u8]], vec![]));
+        // errors name what is wrong
+        let e = parse_state_proof(&serde_json::json!({"result":{}})).unwrap_err();
+        assert!(e.contains("accountProof"), "{e}");
+        assert!(parse_state_proof(&serde_json::json!({"result":{"accountProof":["zz"]}})).is_err());
+        assert!(parse_state_proof(&serde_json::json!({"result":{"accountProof":[1]}})).is_err());
+        assert!(parse_state_proof(&serde_json::json!({"result":{"accountProof":"0x"}})).is_err());
+    }
+
+    #[test]
+    fn fetch_state_proof_reads_saves_and_reports_rpc_errors_offline() {
+        let dir = std::env::temp_dir().join(format!("le-sync-sp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.display().to_string();
+        let ok = r#"{"result":{"accountProof":["0x01"],"storageProof":[]}}"#;
+        fs::write(dir.join("state_proof.json"), ok).unwrap();
+        let saved = std::env::temp_dir().join(format!("le-sync-sp-saved-{}", std::process::id()));
+        let v = fetch_state_proof(&src, Some(&saved), &[0u8; 20], &[0u8; 32], 1).unwrap();
+        assert!(v.get("result").is_some());
+        assert_eq!(
+            fs::read_to_string(saved.join("state_proof.json")).unwrap(),
+            ok
+        );
+
+        fs::write(
+            dir.join("state_proof.json"),
+            r#"{"error":{"code":-32000,"message":"missing trie node"}}"#,
+        )
+        .unwrap();
+        let e = fetch_state_proof(&src, None, &[0u8; 20], &[0u8; 32], 1).unwrap_err();
+        assert!(
+            e.contains("eth_getProof failed") && e.contains("missing trie node"),
+            "{e}"
+        );
+
+        let e = fetch_state_proof(&src, None, &[0u8; 20], &[0u8; 32], 1);
+        assert!(e.is_err());
+        let missing = dir.join("nope").display().to_string();
+        let e = fetch_state_proof(&missing, None, &[0u8; 20], &[0u8; 32], 1).unwrap_err();
+        assert!(e.contains("state_proof.json"), "{e}");
+    }
+
+    /// `write_fixture` plus chain files, a supermajority `finality_update` carrying an execution
+    /// header, and a saved `state_proof.json`.
+    fn write_state_dir(tag: &str) -> (PathBuf, Bytes32) {
+        let (dir, root) = write_fixture(tag);
+        write_chain_files(&dir, Some(1), 0xAA, [0, 0, 0, 1], 0);
+        let p = dir.join("finality_update.json");
+        let mut v: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        v["data"]["sync_aggregate"]["sync_committee_bits"] =
+            format!("0x{}", "ff".repeat(64)).into();
+        v["data"]["finalized_header"]["execution"] = exec_json();
+        v["data"]["finalized_header"]["execution_branch"] = serde_json::json!(vec![x(&leaf(9)); 4]);
+        fs::write(&p, v.to_string()).unwrap();
+        fs::write(
+            dir.join("state_proof.json"),
+            serde_json::json!({"result":{
+                "accountProof": ["0xf90001", "0x80"],
+                "storageProof": [{"key": "0x1", "proof": ["0xc0"]}]
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    fn state_opts_for(dir: &PathBuf, st: StateOpts) -> Opts {
+        Opts {
+            state: StateOpts {
+                address: Some([0x11; 20]),
+                slot: Some(word(1)),
+                execution_rpc: Some(dir.display().to_string()),
+                ..st
+            },
+            ..opts(dir, [0u8; 32], false)
+        }
+    }
+
+    #[test]
+    fn collect_builds_the_state_section_from_the_newest_anchor_and_the_saved_proof() {
+        let (dir, root) = write_state_dir("st-ok");
+        let mut o = state_opts_for(&dir, StateOpts::default());
+        o.trusted_root = root;
+        let c = collect_checked(&o).unwrap();
+        assert!(c.input.sync.is_some(), "--address implies --sync");
+        let st = c.input.state.as_ref().unwrap();
+        assert_eq!((st.address, st.slot), ([0x11; 20], word(1)));
+        assert_eq!(st.exec.block_number, 24_000_123);
+        assert_eq!(st.exec.state_root, [3u8; 32]);
+        assert_eq!(st.exec_branch.len(), 4);
+        assert_eq!(st.account_proof, vec![vec![0xf9u8, 0, 1], vec![0x80]]);
+        assert_eq!(st.storage_proof, vec![vec![0xc0u8]]);
+
+        // slot defaults to 0
+        let mut d = o.clone();
+        d.state.slot = None;
+        assert_eq!(
+            collect_checked(&d).unwrap().input.state.unwrap().slot,
+            [0u8; 32]
+        );
+
+        // --tamper-state flips only the first byte of the first account node
+        let mut t = o.clone();
+        t.state.tamper_state = true;
+        let ts = collect_checked(&t).unwrap().input.state.unwrap();
+        assert_eq!(ts.account_proof, vec![vec![0xf8u8, 0, 1], vec![0x80]]);
+        assert_eq!(ts.exec, st.exec);
+
+        // --tamper-exec flips one bit of the execution state root only
+        let mut t = o.clone();
+        t.state.tamper_exec = true;
+        let ts = collect_checked(&t).unwrap().input.state.unwrap();
+        assert_eq!(ts.exec.state_root[0], 3 ^ 1);
+        assert_eq!(&ts.exec.state_root[1..], &[3u8; 31][..]);
+        assert_eq!(ts.account_proof, st.account_proof);
+
+        // a run without --address has no state section
+        let plain = collect_checked(&Opts {
+            trusted_root: root,
+            ..opts(&dir, root, false)
+        })
+        .unwrap();
+        assert!(plain.input.state.is_none());
+    }
+
+    #[test]
+    fn collect_without_a_usable_anchor_is_a_clear_error() {
+        // the plain fixture's updates carry no execution data and an empty participation bitfield
+        let (dir, root) = write_fixture("st-none");
+        write_chain_files(&dir, Some(1), 0xAA, [0, 0, 0, 1], 0);
+        let mut o = state_opts_for(&dir, StateOpts::default());
+        o.trusted_root = root;
+        let e = collect_checked(&o).err().unwrap();
+        assert!(
+            e.contains("no update with a finalized execution header"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn parse_args_reads_the_state_flags_and_validates_them() {
+        let addr = format!("0x{}", "11".repeat(20));
+        let o = parse_args(args(&[
+            "--source",
+            "/d",
+            "--trusted-root",
+            ROOT,
+            "--address",
+            &addr,
+            "--slot",
+            "0x1",
+            "--execution-rpc",
+            "/rpc",
+            "--expect-value",
+            "0x1234",
+            "--expect-balance",
+            "0x0f4240",
+            "--tamper-state",
+            "--tamper-exec",
+        ]))
+        .unwrap();
+        let st = &o.state;
+        assert_eq!(st.address, Some([0x11; 20]));
+        assert_eq!(st.slot, Some(word(1)));
+        assert_eq!(st.execution_rpc.as_deref(), Some("/rpc"));
+        assert_eq!(&st.expect_value.unwrap()[30..], &[0x12, 0x34]);
+        assert_eq!(&st.expect_balance.unwrap()[29..], &[0x0f, 0x42, 0x40]);
+        assert!(st.tamper_state && st.tamper_exec && st.requested());
+        assert!(o.wants_sync(), "--address implies --sync");
+
+        let min = parse_args(args(&["--source", "/d", "--trusted-root", ROOT])).unwrap();
+        assert_eq!(min.state, StateOpts::default());
+        assert!(!min.state.requested() && !min.wants_sync());
+
+        let e = |a: &[&str]| parse_args(args(a)).unwrap_err();
+        let base = ["--source", "/d", "--trusted-root", ROOT];
+        let with = |extra: &[&str]| -> Vec<String> {
+            base.iter()
+                .chain(extra.iter())
+                .map(|s| s.to_string())
+                .collect()
+        };
+        for lone in [
+            vec!["--slot", "0x1"],
+            vec!["--execution-rpc", "/r"],
+            vec!["--expect-value", "0x1"],
+            vec!["--expect-balance", "0x1"],
+            vec!["--tamper-state"],
+            vec!["--tamper-exec"],
+        ] {
+            let err = parse_args(with(&lone)).unwrap_err();
+            assert!(err.contains("need --address"), "{lone:?}: {err}");
+        }
+        let err = parse_args(with(&["--address", &addr])).unwrap_err();
+        assert!(err.contains("--execution-rpc"), "{err}");
+        assert!(e(&["--address", "0x12"]).contains("--address"));
+        let err = parse_args(with(&[
+            "--address",
+            &"11".repeat(19),
+            "--execution-rpc",
+            "/r",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.contains("--address") && err.contains("20 bytes"),
+            "{err}"
+        );
+        let err = parse_args(with(&[
+            "--address",
+            &addr,
+            "--execution-rpc",
+            "/r",
+            "--slot",
+            "zz",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--slot"), "{err}");
+    }
+
+    fn state_journal(root: Bytes32, own: &ChainBinding, addr: [u8; 20]) -> GuestOutput {
+        GuestOutput {
+            state_checked: true,
+            state_ok: true,
+            state_address: addr,
+            state_slot: [0u8; 32],
+            state_value: word(5),
+            account_balance: word(6),
+            account_present: true,
+            ..journal(root, own, 1, 0)
+        }
+    }
+
+    fn judge_opts(root: Bytes32, st: StateOpts) -> Opts {
+        Opts {
+            sync: true,
+            state: st,
+            ..opts(&PathBuf::new(), root, false)
+        }
+    }
+
+    #[test]
+    fn judge_requires_the_committed_state_to_match_the_request() {
+        let root = [3u8; 32];
+        let own = bind(1, 0xAA);
+        let addr = [0x11u8; 20];
+        let st = StateOpts {
+            address: Some(addr),
+            execution_rpc: Some("x".into()),
+            ..Default::default()
+        };
+        let o = judge_opts(root, st.clone());
+        let j = state_journal(root, &own, addr);
+        assert_eq!(judge(&o, &j, Some(&own)), Verdict::Ok);
+
+        let not_ok = |mutate: &dyn Fn(&mut GuestOutput)| {
+            let mut b = j.clone();
+            mutate(&mut b);
+            judge(&o, &b, Some(&own))
+        };
+        assert_eq!(
+            not_ok(&|b| b.state_address = [0x12; 20]),
+            Verdict::StateNotOk
+        );
+        assert_eq!(not_ok(&|b| b.state_ok = false), Verdict::StateNotOk);
+        assert_eq!(not_ok(&|b| b.state_checked = false), Verdict::StateNotOk);
+        assert_eq!(not_ok(&|b| b.state_error_code = 201), Verdict::StateNotOk);
+        assert_eq!(not_ok(&|b| b.state_slot = word(1)), Verdict::StateNotOk);
+
+        // the requested slot must be the committed one (default: zero)
+        let o1 = judge_opts(
+            root,
+            StateOpts {
+                slot: Some(word(1)),
+                ..st.clone()
+            },
+        );
+        assert_eq!(judge(&o1, &j, Some(&own)), Verdict::StateNotOk);
+        let mut j1 = j.clone();
+        j1.state_slot = word(1);
+        assert_eq!(judge(&o1, &j1, Some(&own)), Verdict::Ok);
+
+        // expected value / balance are compared against the journal
+        for (v, want) in [(5u8, Verdict::Ok), (6, Verdict::StateNotOk)] {
+            let ov = judge_opts(
+                root,
+                StateOpts {
+                    expect_value: Some(word(v)),
+                    ..st.clone()
+                },
+            );
+            assert_eq!(judge(&ov, &j, Some(&own)), want, "value {v}");
+        }
+        for (b, want) in [(6u8, Verdict::Ok), (5, Verdict::StateNotOk)] {
+            let ob = judge_opts(
+                root,
+                StateOpts {
+                    expect_balance: Some(word(b)),
+                    ..st.clone()
+                },
+            );
+            assert_eq!(judge(&ob, &j, Some(&own)), want, "balance {b}");
+        }
+
+        // Sprint 1-3 failures still win: a bad sync run is NotOk, not StateNotOk
+        let mut bad_sync = j.clone();
+        bad_sync.sync_validated = 0;
+        assert_eq!(judge(&o, &bad_sync, Some(&own)), Verdict::NotOk);
+
+        // without --address the state part of the journal is not judged at all
+        let plain = judge_opts(root, StateOpts::default());
+        assert_eq!(
+            judge(&plain, &journal(root, &own, 1, 0), Some(&own)),
+            Verdict::Ok
+        );
+    }
+
+    #[test]
+    fn judge_tamper_runs_must_be_rejected_with_the_specific_typed_error() {
+        let root = [3u8; 32];
+        let own = bind(1, 0xAA);
+        let addr = [0x11u8; 20];
+        let base = StateOpts {
+            address: Some(addr),
+            execution_rpc: Some("x".into()),
+            ..Default::default()
+        };
+        let rejected = |code: u16| GuestOutput {
+            state_checked: true,
+            state_error_code: code,
+            ..journal(root, &own, 1, 0)
+        };
+        let ts = judge_opts(
+            root,
+            StateOpts {
+                tamper_state: true,
+                ..base.clone()
+            },
+        );
+        assert_eq!(
+            judge(&ts, &rejected(Error::InvalidTrieProof.code()), Some(&own)),
+            Verdict::Ok
+        );
+        assert_eq!(
+            judge(&ts, &rejected(Error::InvalidBranch.code()), Some(&own)),
+            Verdict::StateNotOk
+        );
+        assert_eq!(judge(&ts, &rejected(0), Some(&own)), Verdict::StateNotOk);
+        // the guest accepting tampered data is the failure we are testing for
+        assert_eq!(
+            judge(&ts, &state_journal(root, &own, addr), Some(&own)),
+            Verdict::StateNotOk
+        );
+        // never evaluated is not a rejection either
+        assert_eq!(
+            judge(&ts, &journal(root, &own, 1, 0), Some(&own)),
+            Verdict::StateNotOk
+        );
+
+        let te = judge_opts(
+            root,
+            StateOpts {
+                tamper_exec: true,
+                ..base.clone()
+            },
+        );
+        assert_eq!(
+            judge(&te, &rejected(Error::InvalidBranch.code()), Some(&own)),
+            Verdict::Ok
+        );
+        assert_eq!(
+            judge(&te, &rejected(Error::InvalidTrieProof.code()), Some(&own)),
+            Verdict::StateNotOk
+        );
+
+        // both flags: the anchor is checked first, so the branch error is the expected one
+        let both = judge_opts(
+            root,
+            StateOpts {
+                tamper_state: true,
+                tamper_exec: true,
+                ..base
+            },
+        );
+        assert_eq!(
+            judge(&both, &rejected(Error::InvalidBranch.code()), Some(&own)),
+            Verdict::Ok
+        );
+        assert_eq!(
+            judge(&both, &rejected(Error::InvalidTrieProof.code()), Some(&own)),
+            Verdict::StateNotOk
+        );
+
+        assert_eq!(verdict_exit_code(&Verdict::StateNotOk), 1);
     }
 }

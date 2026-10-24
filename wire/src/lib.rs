@@ -1,10 +1,13 @@
 //! Guest input/output types and `verify`, the whole of what the zkVM guest executes
-//! (bootstrap, finality branches, sync-update validation incl. BLS, chain-binding commitment).
+//! (bootstrap, finality branches, sync-update validation incl. BLS, chain-binding commitment,
+//! and, Sprint 4, the execution anchor plus account/storage proofs under the finalized header).
 //! Kept free of risc0 so it runs natively in tests; the guest is a 3-line wrapper.
 //!
 //! serde note: `[u8; 48]` has no serde impl, so pubkeys travel as one flat `Vec<u8>`.
 pub mod bls;
 
+use le_sync_core::exec::{verify_execution_anchor, ExecutionPayloadHeader};
+use le_sync_core::state::{verify_account, verify_storage, Account, Address};
 use le_sync_core::sync::{
     has_supermajority, initialize_light_client_store, process_light_client_update, Bls,
     ChainBinding, ForkSchedule, LightClientStore, LightClientUpdate, SyncCommittee, SyncConfig,
@@ -90,6 +93,110 @@ pub struct SyncInput {
     pub updates: Vec<UpdateWire>,
 }
 
+/// `ExecutionPayloadHeader` on the wire (Deneb layout, 17 fields). `logs_bloom` (256 bytes) and
+/// `extra_data` (at most 32 bytes) are `Vec`s because `[u8; N]` has no serde impl above 32.
+/// `base_fee_per_gas` is the SSZ (little-endian) uint256 encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ExecWire {
+    pub parent_hash: Bytes32,
+    pub fee_recipient: [u8; 20],
+    pub state_root: Bytes32,
+    pub receipts_root: Bytes32,
+    pub logs_bloom: Vec<u8>,
+    pub prev_randao: Bytes32,
+    pub block_number: u64,
+    pub gas_limit: u64,
+    pub gas_used: u64,
+    pub timestamp: u64,
+    pub extra_data: Vec<u8>,
+    pub base_fee_per_gas: Bytes32,
+    pub block_hash: Bytes32,
+    pub transactions_root: Bytes32,
+    pub withdrawals_root: Bytes32,
+    pub blob_gas_used: u64,
+    pub excess_blob_gas: u64,
+}
+
+impl ExecWire {
+    /// `None` if `logs_bloom` is not 256 bytes or `extra_data` exceeds 32 bytes (not a valid
+    /// header). The result is only a CLAIM: nothing in it is trusted until
+    /// `verify_execution_anchor` has tied its root to the finalized beacon header.
+    pub fn to_header(&self) -> Option<ExecutionPayloadHeader> {
+        if self.logs_bloom.len() != le_sync_core::exec::BLOOM_LEN
+            || self.extra_data.len() > le_sync_core::exec::MAX_EXTRA_DATA
+        {
+            return None;
+        }
+        let mut logs_bloom = [0u8; le_sync_core::exec::BLOOM_LEN];
+        logs_bloom.copy_from_slice(&self.logs_bloom);
+        let mut extra_data = [0u8; le_sync_core::exec::MAX_EXTRA_DATA];
+        extra_data[..self.extra_data.len()].copy_from_slice(&self.extra_data);
+        Some(ExecutionPayloadHeader {
+            parent_hash: self.parent_hash,
+            fee_recipient: self.fee_recipient,
+            state_root: self.state_root,
+            receipts_root: self.receipts_root,
+            logs_bloom,
+            prev_randao: self.prev_randao,
+            block_number: self.block_number,
+            gas_limit: self.gas_limit,
+            gas_used: self.gas_used,
+            timestamp: self.timestamp,
+            extra_data,
+            extra_data_len: self.extra_data.len(),
+            base_fee_per_gas: self.base_fee_per_gas,
+            block_hash: self.block_hash,
+            transactions_root: self.transactions_root,
+            withdrawals_root: self.withdrawals_root,
+            blob_gas_used: self.blob_gas_used,
+            excess_blob_gas: self.excess_blob_gas,
+        })
+    }
+}
+
+impl From<&ExecutionPayloadHeader> for ExecWire {
+    fn from(h: &ExecutionPayloadHeader) -> Self {
+        Self {
+            parent_hash: h.parent_hash,
+            fee_recipient: h.fee_recipient,
+            state_root: h.state_root,
+            receipts_root: h.receipts_root,
+            logs_bloom: h.logs_bloom.to_vec(),
+            prev_randao: h.prev_randao,
+            block_number: h.block_number,
+            gas_limit: h.gas_limit,
+            gas_used: h.gas_used,
+            timestamp: h.timestamp,
+            extra_data: h.extra_data[..h.extra_data_len].to_vec(),
+            base_fee_per_gas: h.base_fee_per_gas,
+            block_hash: h.block_hash,
+            transactions_root: h.transactions_root,
+            withdrawals_root: h.withdrawals_root,
+            blob_gas_used: h.blob_gas_used,
+            excess_blob_gas: h.excess_blob_gas,
+        }
+    }
+}
+
+/// Sprint 4 section: one account and one storage slot under the execution state root of the
+/// store's FINAL finalized header. There is deliberately no `state_root` field: the root is
+/// read out of `exec` only after `exec` has been proven (via `exec_branch`, gindex 25) to be the
+/// execution payload header of that finalized beacon header. Requires a `sync` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StateInput {
+    pub exec: ExecWire,
+    pub exec_branch: Vec<Bytes32>,
+    pub address: Address,
+    /// 32-byte big-endian storage key.
+    pub slot: Bytes32,
+    /// `eth_getProof` `accountProof`: RLP nodes, root first.
+    pub account_proof: Vec<Vec<u8>>,
+    /// `eth_getProof` `storageProof[0].proof`: RLP nodes, root first.
+    pub storage_proof: Vec<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GuestInput {
@@ -105,6 +212,8 @@ pub struct GuestInput {
     pub boot_branch: Vec<Bytes32>,
     pub finality: Vec<FinalityItem>,
     pub sync: Option<SyncInput>,
+    /// Sprint 4: account + storage inclusion under the final finalized header. Needs `sync`.
+    pub state: Option<StateInput>,
 }
 
 /// Committed to the journal. The host trusts only this, not its own re-computation.
@@ -137,6 +246,27 @@ pub struct GuestOutput {
     /// `ChainBinding::digest()` over chain id, gvr, fork-schedule hash and preset timing.
     /// Zero when there is no sync section or the fork schedule is malformed (fail closed).
     pub chain_binding: Bytes32,
+    /// Sprint 4. `true` once a state section was evaluated against the store's final finalized
+    /// header (needs a `sync` section whose bootstrap and setup succeeded). Every field below is
+    /// zero / false unless `state_ok`: a failed state check commits nothing about the state.
+    pub state_checked: bool,
+    /// Anchor, account proof and storage proof all verified.
+    pub state_ok: bool,
+    /// `Error::code()` of the failing stage when `state_checked && !state_ok`, else 0.
+    pub state_error_code: u16,
+    /// Execution block the verified state belongs to (from the proven execution header).
+    pub exec_block_number: u64,
+    pub exec_block_hash: Bytes32,
+    /// The state root the account proof was checked against. Derived in the guest, never input.
+    pub exec_state_root: Bytes32,
+    pub state_address: [u8; 20],
+    pub state_slot: Bytes32,
+    /// Big-endian slot value; zero for an absent slot (a verified zero) or an absent account.
+    pub state_value: Bytes32,
+    /// `false` = the account is proven absent from the state trie.
+    pub account_present: bool,
+    /// Big-endian wei balance of the account; zero when absent.
+    pub account_balance: Bytes32,
 }
 
 impl GuestOutput {
@@ -288,7 +418,7 @@ fn run_sync<B: Bls>(
     bls: &B,
     out: &mut GuestOutput,
     mut trace: Option<&mut Vec<UpdateOutcome>>,
-) {
+) -> Option<BeaconBlockHeader> {
     let ta = cc();
     let n_updates = s.updates.len() as u32;
     let header = BeaconBlockHeader::from(&i.boot_header);
@@ -306,7 +436,7 @@ fn run_sync<B: Bls>(
             for _ in &s.updates {
                 note(&mut trace, UpdateOutcome::SetupFailed(e));
             }
-            return;
+            return None;
         }
     };
     let tb = cc();
@@ -330,7 +460,7 @@ fn run_sync<B: Bls>(
             for _ in &s.updates {
                 note(&mut trace, UpdateOutcome::SetupFailed(e));
             }
-            return;
+            return None;
         }
     };
     let tc = cc();
@@ -393,6 +523,63 @@ fn run_sync<B: Bls>(
         tc - tb,
         td - tc
     ));
+    // The state section anchors to exactly this header: it is the store's trusted head.
+    Some(store.finalized_header)
+}
+
+/// Sprint 4: the execution anchor, then the account proof, then the storage proof, all under
+/// `finalized` (the store's final finalized header, already trusted by the sync run).
+///
+/// Fail closed: on any error only `state_checked` and `state_error_code` are set. On success the
+/// committed values come from the verified header and the verified tries, never from the input
+/// (the input's `address` and `slot` are echoed because the proofs verified exactly those keys).
+fn verify_state_section(
+    cfg: &ChainConfig,
+    finalized: &BeaconBlockHeader,
+    st: &StateInput,
+    out: &mut GuestOutput,
+) {
+    out.state_checked = true;
+    let t0 = cc();
+    let run = || -> Result<_, Error> {
+        // A malformed header cannot hash to anything the beacon header vouches for.
+        let exec = st.exec.to_header().ok_or(Error::InvalidBranch)?;
+        let state_root = verify_execution_anchor(cfg, finalized, &exec, &st.exec_branch)?;
+        let t1 = cc();
+        let acct = verify_account(&state_root, &st.address, &st.account_proof)?;
+        let t2 = cc();
+        // Same semantics as `le_sync_core::state::verify_state` (a test pins the equivalence);
+        // split here only so each proof gets its own cycle marker.
+        let (account, present, value) = match acct {
+            None => (Account::ABSENT, false, ZERO),
+            Some(a) => {
+                let v = verify_storage(&a.storage_root, &st.slot, &st.storage_proof)?;
+                (a, true, v)
+            }
+        };
+        let t3 = cc();
+        log(&format!(
+            "state cycles: anchor={} account_proof={} storage_proof={}",
+            t1 - t0,
+            t2 - t1,
+            t3 - t2
+        ));
+        Ok((exec, state_root, account, present, value))
+    };
+    match run() {
+        Ok((exec, state_root, account, present, value)) => {
+            out.state_ok = true;
+            out.exec_block_number = exec.block_number;
+            out.exec_block_hash = exec.block_hash;
+            out.exec_state_root = state_root;
+            out.state_address = st.address;
+            out.state_slot = st.slot;
+            out.state_value = value;
+            out.account_present = present;
+            out.account_balance = account.balance;
+        }
+        Err(e) => out.state_error_code = e.code(),
+    }
 }
 
 /// Never panics on malformed input: it just reports `bootstrap_ok = false` / rejections.
@@ -485,7 +672,13 @@ fn verify_inner<B: Bls>(
         t2 - t1
     ));
     if let Some(s) = &i.sync {
-        run_sync(i, s, cfg, bls, &mut out, trace);
+        let final_header = run_sync(i, s, cfg, bls, &mut out, trace);
+        // Sprint 4. Only against the store's final finalized header; if the sync setup failed
+        // there is no such header and the state section is not evaluated (`state_checked` stays
+        // false), so nothing about the state is committed.
+        if let (Some(st), Some(fh)) = (&i.state, final_header) {
+            verify_state_section(&cfg, &fh, st, &mut out);
+        }
     }
     out
 }
@@ -555,6 +748,10 @@ mod tests {
     /// `seed` changes the committee keys (and so the bootstrap state root and trusted root);
     /// seed 0 is the honest fixture.
     fn fixture_seeded(seed: u8) -> GuestInput {
+        fixture_with_body(seed, leaf(2))
+    }
+    /// `fin_body`: body root of the finalized header (the execution anchor hangs off it).
+    fn fixture_with_body(seed: u8, fin_body: Bytes32) -> GuestInput {
         let keys: Vec<BlsPubkey> = (0..N)
             .map(|i| {
                 let mut k = [0u8; 48];
@@ -570,7 +767,8 @@ mod tests {
         let boot = hdr(8, sroot);
         let boot_root = BeaconBlockHeader::from(&boot).hash_tree_root();
 
-        let fin = hdr(24, leaf(9));
+        let mut fin = hdr(24, leaf(9));
+        fin.body_root = fin_body;
         let epoch_chunk = leaf(77);
         let mut g: Vec<Bytes32> = (0..64).map(|i| leaf(150 + i as u8)).collect();
         g[20] = hash_pair(
@@ -601,6 +799,7 @@ mod tests {
                 },
             ],
             sync: None,
+            state: None,
         }
     }
 
@@ -1161,5 +1360,459 @@ mod tests {
         );
         assert!(t.output.bootstrap_ok);
         assert_eq!(t.output.sync_rejected, 1);
+    }
+
+    // ==== Sprint 4: execution anchor + account/storage proofs ===================================
+
+    use le_sync_core::keccak::{EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
+    use le_sync_core::state::{account_key, storage_key, verify_state};
+    use le_sync_testkit::trie::{rlp_bytes, rlp_list, Trie};
+
+    /// Like `Mock`, but accepts the signing root of an arbitrary attested header (the Sprint 4
+    /// fixtures change the finalized header, so the attested header differs from `fixture()`'s).
+    struct MockAt(Bytes32);
+    impl Bls for MockAt {
+        fn fast_aggregate_verify(
+            &self,
+            c: &[BlsPubkey],
+            _agg: &BlsPubkey,
+            bits: &[u8],
+            root: &Bytes32,
+            sig: &le_sync_core::sync::BlsSignature,
+        ) -> bool {
+            assert_eq!(c.len(), bits.len() * 8);
+            let want = le_sync_core::sync::compute_signing_root(
+                &self.0,
+                &le_sync_core::sync::compute_domain(
+                    le_sync_core::sync::DOMAIN_SYNC_COMMITTEE,
+                    FV,
+                    &GVR,
+                ),
+            );
+            sig[0] == 7 && *root == want
+        }
+    }
+
+    const ADDR: Address = [0x11; 20];
+    const SLOT: Bytes32 = {
+        let mut s = [0u8; 32];
+        s[31] = 1;
+        s
+    };
+    const SLOT2: Bytes32 = {
+        let mut s = [0u8; 32];
+        s[31] = 2;
+        s
+    };
+
+    fn trim_be(v: u128) -> Vec<u8> {
+        let b = v.to_be_bytes();
+        let i = b.iter().position(|x| *x != 0).unwrap_or(b.len());
+        b[i..].to_vec()
+    }
+    fn be32(bytes: &[u8]) -> Bytes32 {
+        let mut o = [0u8; 32];
+        o[32 - bytes.len()..].copy_from_slice(bytes);
+        o
+    }
+
+    struct World {
+        state: Trie,
+        storage: Trie,
+    }
+
+    /// `ADDR`: nonce 7, balance 1_000_000, storage {SLOT: 0x1234, SLOT2: 5}; plus filler accounts.
+    fn world(balance: u128) -> World {
+        let storage = Trie::new(&[
+            (storage_key(&SLOT), rlp_bytes(&[0x12, 0x34])),
+            (storage_key(&SLOT2), rlp_bytes(&[5])),
+        ]);
+        let mut es = vec![(
+            account_key(&ADDR),
+            rlp_list(&[
+                rlp_bytes(&[7]),
+                rlp_bytes(&trim_be(balance)),
+                rlp_bytes(&storage.root),
+                rlp_bytes(&[0xCC; 32]),
+            ]),
+        )];
+        for k in 0x22..0x2au8 {
+            es.push((
+                account_key(&[k; 20]),
+                rlp_list(&[
+                    rlp_bytes(&[]),
+                    rlp_bytes(&[k]),
+                    rlp_bytes(&EMPTY_TRIE_ROOT),
+                    rlp_bytes(&EMPTY_CODE_HASH),
+                ]),
+            ));
+        }
+        World {
+            state: Trie::new(&es),
+            storage,
+        }
+    }
+
+    fn exec_for(state_root: Bytes32) -> ExecutionPayloadHeader {
+        ExecutionPayloadHeader {
+            parent_hash: [0x51; 32],
+            fee_recipient: [0x52; 20],
+            state_root,
+            receipts_root: [0x53; 32],
+            logs_bloom: [0x54; 256],
+            prev_randao: [0x55; 32],
+            block_number: 24_000_123,
+            gas_limit: 36_000_000,
+            gas_used: 777,
+            timestamp: 1_700_000_000,
+            extra_data: {
+                let mut e = [0u8; 32];
+                e[..3].copy_from_slice(b"le!");
+                e
+            },
+            extra_data_len: 3,
+            base_fee_per_gas: [0x56; 32],
+            block_hash: [0x57; 32],
+            transactions_root: [0x58; 32],
+            withdrawals_root: [0x59; 32],
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+
+    /// BeaconBlockBody: 16 padded leaves, `execution_payload` at index 9 (gindex 25, depth 4).
+    fn body_tree(exec_root: Bytes32) -> (Bytes32, Vec<Bytes32>) {
+        let mut level: Vec<Bytes32> = (0..16u8).map(|i| [0x40 + i; 32]).collect();
+        level[9] = exec_root;
+        let (mut idx, mut branch) = (9usize, vec![]);
+        while level.len() > 1 {
+            branch.push(level[idx ^ 1]);
+            level = level.chunks(2).map(|p| hash_pair(&p[0], &p[1])).collect();
+            idx /= 2;
+        }
+        (level[0], branch)
+    }
+
+    fn state_input(w: &World, exec: &ExecutionPayloadHeader, branch: Vec<Bytes32>) -> StateInput {
+        StateInput {
+            exec: ExecWire::from(exec),
+            exec_branch: branch,
+            address: ADDR,
+            slot: SLOT,
+            account_proof: w.state.prove(&account_key(&ADDR)),
+            storage_proof: w.storage.prove(&storage_key(&SLOT)),
+        }
+    }
+
+    /// A full honest run: bootstrap, one validated finality update whose finalized header's body
+    /// holds `exec`, and a state section for (`ADDR`, `SLOT`).
+    fn state_fixture() -> (GuestInput, World) {
+        let w = world(1_000_000);
+        let exec = exec_for(w.state.root);
+        let (body_root, branch) = body_tree(exec.hash_tree_root().unwrap());
+        let mut i = with_sync(fixture_with_body(0, body_root));
+        i.state = Some(state_input(&w, &exec, branch));
+        (i, w)
+    }
+
+    fn run(i: &GuestInput) -> GuestOutput {
+        let att = BeaconBlockHeader::from(&i.finality[0].attested).hash_tree_root();
+        verify(i, &MockAt(att))
+    }
+
+    /// A rejected state check commits nothing about the state except the error code.
+    fn assert_state_rejected(o: &GuestOutput, e: Error) {
+        assert!(o.state_checked && !o.state_ok, "{o:?}");
+        assert_eq!(o.state_error_code, e.code(), "{o:?}");
+        assert_eq!(
+            (
+                o.exec_block_number,
+                o.exec_block_hash,
+                o.exec_state_root,
+                o.state_address,
+                o.state_slot,
+                o.state_value,
+                o.account_present,
+                o.account_balance
+            ),
+            (0, ZERO, ZERO, [0; 20], ZERO, ZERO, false, ZERO),
+            "{o:?}"
+        );
+    }
+
+    #[test]
+    fn state_proof_verifies_and_the_journal_commits_the_values() {
+        let (i, w) = state_fixture();
+        let o = run(&i);
+        assert_eq!((o.sync_validated, o.sync_rejected), (1, 0), "{o:?}");
+        assert!(o.state_checked && o.state_ok, "{o:?}");
+        assert_eq!(o.state_error_code, 0);
+        let st = i.state.as_ref().unwrap();
+        // every committed value comes from the proven header / verified tries
+        assert_eq!(o.exec_block_number, 24_000_123);
+        assert_eq!(o.exec_block_hash, [0x57; 32]);
+        assert_eq!(o.exec_state_root, w.state.root);
+        assert_eq!((o.state_address, o.state_slot), (ADDR, SLOT));
+        assert_eq!(o.state_value, be32(&[0x12, 0x34]));
+        assert!(o.account_present);
+        assert_eq!(o.account_balance, be32(&trim_be(1_000_000)));
+        // the state hangs off the finalized header the same journal commits
+        assert_eq!(o.finalized_slot, 24);
+        // same answer as the core one-shot `verify_state`
+        let c = verify_state(
+            &w.state.root,
+            &st.address,
+            &st.account_proof,
+            &st.slot,
+            &st.storage_proof,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.value, c.account.balance, c.account_present),
+            (o.state_value, o.account_balance, o.account_present)
+        );
+        // the proof format and everything above is unchanged by the trace variant
+        assert_eq!(
+            verify_trace(
+                &i,
+                &MockAt(BeaconBlockHeader::from(&i.finality[0].attested).hash_tree_root())
+            )
+            .output,
+            o
+        );
+    }
+
+    #[test]
+    fn absent_slot_and_absent_account_are_verified_exclusions() {
+        let (mut i, w) = state_fixture();
+        // absent slot of a present account: a verified zero
+        let s = i.state.as_mut().unwrap();
+        s.slot = [0x77; 32];
+        s.storage_proof = w.storage.prove(&storage_key(&[0x77; 32]));
+        let o = run(&i);
+        assert!(o.state_ok && o.account_present, "{o:?}");
+        assert_eq!((o.state_slot, o.state_value), ([0x77; 32], ZERO));
+        assert_eq!(o.account_balance, be32(&trim_be(1_000_000)));
+
+        // absent account: zero balance, zero value, storage proof not consulted
+        let (mut i, w) = state_fixture();
+        let s = i.state.as_mut().unwrap();
+        s.address = [0x99; 20];
+        s.account_proof = w.state.prove(&account_key(&[0x99; 20]));
+        s.storage_proof = vec![];
+        let o = run(&i);
+        assert!(o.state_ok && !o.account_present, "{o:?}");
+        assert_eq!(
+            (o.state_address, o.state_value, o.account_balance),
+            ([0x99; 20], ZERO, ZERO)
+        );
+        assert_eq!(o.exec_state_root, w.state.root);
+    }
+
+    #[test]
+    fn beacon_part_verifies_but_tampered_execution_branch_is_rejected() {
+        let (i, _) = state_fixture();
+        let n_nodes = i.state.as_ref().unwrap().exec_branch.len();
+        assert_eq!(n_nodes, 4);
+        for n in 0..n_nodes {
+            let mut t = i.clone();
+            t.state.as_mut().unwrap().exec_branch[n][0] ^= 1;
+            let o = run(&t);
+            // Sprint 1-3 verdicts are untouched: only the state section fails
+            assert_eq!(
+                (o.bootstrap_ok, o.sync_validated, o.sync_rejected),
+                (true, 1, 0)
+            );
+            assert_state_rejected(&o, Error::InvalidBranch);
+        }
+    }
+
+    #[test]
+    fn a_forged_state_root_is_rejected_even_with_matching_proofs() {
+        // The attacker builds a self-consistent fake world (a huge balance) and an execution
+        // header carrying ITS state root. Both tries verify against each other, but the header
+        // is not the one the finalized beacon header commits to.
+        let (honest, _) = state_fixture();
+        let fake = world(999_999_999_999);
+        let fake_exec = exec_for(fake.state.root);
+        let mut i = honest.clone();
+        let branch = i.state.as_ref().unwrap().exec_branch.clone();
+        i.state = Some(state_input(&fake, &fake_exec, branch));
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+
+        // just swapping the state root inside the honest header
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().exec.state_root = [0xEE; 32];
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+
+        // any other field of the execution header is covered by the same root
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().exec.block_number += 1;
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+        let mut i = honest;
+        i.state.as_mut().unwrap().exec.logs_bloom[255] ^= 1;
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+    }
+
+    #[test]
+    fn malformed_execution_header_is_rejected_not_a_panic() {
+        let (honest, _) = state_fixture();
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().exec.logs_bloom.pop();
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().exec.extra_data = vec![1; 33];
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+        let mut i = honest;
+        i.state.as_mut().unwrap().exec_branch = vec![];
+        assert_state_rejected(&run(&i), Error::InvalidBranch);
+    }
+
+    #[test]
+    fn tampered_account_proof_is_rejected() {
+        let (honest, _) = state_fixture();
+        let nodes = honest.state.as_ref().unwrap().account_proof.len();
+        assert!(nodes >= 2);
+        for n in 0..nodes {
+            let len = honest.state.as_ref().unwrap().account_proof[n].len();
+            for b in [0, len / 2, len - 1] {
+                let mut i = honest.clone();
+                i.state.as_mut().unwrap().account_proof[n][b] ^= 1;
+                assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+            }
+        }
+        // truncated, extra, empty
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().account_proof.pop();
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+        let mut i = honest.clone();
+        let extra = i.state.as_ref().unwrap().account_proof[0].clone();
+        i.state.as_mut().unwrap().account_proof.push(extra);
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+        let mut i = honest;
+        i.state.as_mut().unwrap().account_proof.clear();
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+    }
+
+    #[test]
+    fn tampered_storage_proof_is_rejected() {
+        let (honest, _) = state_fixture();
+        let nodes = honest.state.as_ref().unwrap().storage_proof.len();
+        assert!(nodes >= 2);
+        for n in 0..nodes {
+            let len = honest.state.as_ref().unwrap().storage_proof[n].len();
+            for b in [0, len / 2, len - 1] {
+                let mut i = honest.clone();
+                i.state.as_mut().unwrap().storage_proof[n][b] ^= 1;
+                assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+            }
+        }
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().storage_proof.pop();
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+        let mut i = honest.clone();
+        let extra = i.state.as_ref().unwrap().storage_proof[0].clone();
+        i.state.as_mut().unwrap().storage_proof.push(extra);
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+        // a storage proof from another account's trie does not satisfy this account's root
+        let mut i = honest;
+        let other = Trie::new(&[(storage_key(&SLOT), rlp_bytes(&[0x99]))]);
+        i.state.as_mut().unwrap().storage_proof = other.prove(&storage_key(&SLOT));
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+    }
+
+    #[test]
+    fn a_proof_for_one_key_never_proves_another() {
+        let (honest, _) = state_fixture();
+        // wrong slot: SLOT2 exists with value 5, so SLOT's proof cannot prove it (or its absence)
+        let mut i = honest.clone();
+        i.state.as_mut().unwrap().slot = SLOT2;
+        assert_state_rejected(&run(&i), Error::InvalidTrieProof);
+        // wrong address: either a (truthful) exclusion or a rejection, never ADDR's data
+        let mut i = honest;
+        i.state.as_mut().unwrap().address = [0x12; 20];
+        let o = run(&i);
+        if o.state_ok {
+            assert!(!o.account_present, "{o:?}");
+            assert_eq!((o.state_value, o.account_balance), (ZERO, ZERO));
+            assert_eq!(o.state_address, [0x12; 20]);
+        } else {
+            assert_state_rejected(&o, Error::InvalidTrieProof);
+        }
+    }
+
+    #[test]
+    fn the_anchor_must_be_the_stores_final_finalized_header() {
+        // No update applied: the store's finalized header is the bootstrap header, so an
+        // execution header that hangs off the (never applied) update's header cannot vouch.
+        let (mut i, _) = state_fixture();
+        i.sync.as_mut().unwrap().updates.clear();
+        let o = run(&i);
+        assert_eq!(o.sync_validated, 0);
+        assert_state_rejected(&o, Error::InvalidBranch);
+
+        // An update below the 2/3 threshold is rejected, so it cannot move the store either.
+        let (mut i, _) = state_fixture();
+        i.sync.as_mut().unwrap().updates[0].bits = low_bits();
+        let o = run(&i);
+        assert_eq!((o.sync_validated, o.sync_below_threshold), (0, 1));
+        assert_state_rejected(&o, Error::InvalidBranch);
+
+        // A badly signed update likewise.
+        let (mut i, _) = state_fixture();
+        i.sync.as_mut().unwrap().updates[0].signature[0] ^= 1;
+        let o = run(&i);
+        assert_eq!(o.sync_validated, 0);
+        assert_state_rejected(&o, Error::InvalidBranch);
+    }
+
+    #[test]
+    fn state_is_not_evaluated_without_a_trusted_sync_run() {
+        let nothing = |o: &GuestOutput| {
+            assert!(!o.state_checked && !o.state_ok, "{o:?}");
+            assert_eq!(o.state_error_code, 0);
+            assert_eq!(
+                (o.exec_state_root, o.state_value, o.account_present),
+                (ZERO, ZERO, false)
+            );
+        };
+        // no sync section: there is no trusted finalized header to anchor to
+        let (mut i, _) = state_fixture();
+        i.sync = None;
+        nothing(&run(&i));
+        // bootstrap fails
+        let (mut i, _) = state_fixture();
+        i.trusted_root = [0; 32];
+        nothing(&run(&i));
+        // sync setup fails (malformed fork schedule)
+        let (mut i, _) = state_fixture();
+        i.sync.as_mut().unwrap().forks = vec![];
+        nothing(&run(&i));
+        // and a run with no state section commits an all-default state block
+        let o = verify(&with_sync(fixture()), &Mock);
+        nothing(&o);
+        assert_eq!(o.exec_block_number, 0);
+    }
+
+    #[test]
+    fn exec_wire_conversion_is_exact_and_length_checked() {
+        let e = exec_for([0x01; 32]);
+        let w = ExecWire::from(&e);
+        assert_eq!(w.logs_bloom.len(), 256);
+        assert_eq!(w.extra_data, b"le!".to_vec());
+        assert_eq!(w.to_header(), Some(e));
+        assert_eq!(w.to_header().unwrap().hash_tree_root(), e.hash_tree_root());
+        let mut bad = w.clone();
+        bad.logs_bloom = vec![0; 255];
+        assert_eq!(bad.to_header(), None);
+        let mut bad = w.clone();
+        bad.logs_bloom = vec![0; 257];
+        assert_eq!(bad.to_header(), None);
+        let mut ok = w.clone();
+        ok.extra_data = vec![9; 32];
+        assert!(ok.to_header().is_some());
+        let mut bad = w;
+        bad.extra_data = vec![9; 33];
+        assert_eq!(bad.to_header(), None);
     }
 }

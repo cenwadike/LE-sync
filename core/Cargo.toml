@@ -7,3 +7,7 @@ description = "no_std Ethereum light-client primitives (SSZ Merkle branches, LC 
 
 [dependencies]
 sha2 = { version = "0.10", default-features = false }
+# Keccak-256 for the execution-layer trie. no_std. See src/keccak.rs: one function, one place to swap.
+tiny-keccak = { version = "2.0.2", default-features = false, features = [
+    "keccak",
+] }

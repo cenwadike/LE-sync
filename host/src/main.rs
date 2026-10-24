@@ -1,4 +1,5 @@
-//! I/O glue only: parse args, collect, execute the guest, judge the journal. Every decision
+//! I/O glue only: parse args, collect, execute the guest, judge the journal (Sprint 4: also prints
+//! the verified account/slot values). Every decision
 //! with logic in it lives in `le_sync` (lib.rs) where it is unit-tested. This file needs the
 //! built guest ELF to run, so it is excluded from mutation testing (see `.cargo/mutants.toml`).
 
@@ -79,6 +80,31 @@ fn main() -> ExitCode {
                     );
                 }
             }
+            if opts.state.requested() && !(opts.state.tamper_state || opts.state.tamper_exec) {
+                println!(
+                    "state (verified in the guest under finalized slot {}): block {} hash 0x{} state_root 0x{}",
+                    out.finalized_slot,
+                    out.exec_block_number,
+                    hex::encode(out.exec_block_hash),
+                    hex::encode(out.exec_state_root)
+                );
+                println!(
+                    "  account 0x{} present={} balance 0x{}",
+                    hex::encode(out.state_address),
+                    out.account_present,
+                    hex::encode(out.account_balance)
+                );
+                println!(
+                    "  slot 0x{} value 0x{}",
+                    hex::encode(out.state_slot),
+                    hex::encode(out.state_value)
+                );
+            } else if opts.state.requested() {
+                println!(
+                    "state rejected by the guest, as expected for this run (code {})",
+                    out.state_error_code
+                );
+            }
             println!("OK");
         }
         Verdict::ChainMismatch(e) => {
@@ -102,6 +128,10 @@ fn main() -> ExitCode {
         Verdict::TrustedRootDiffers => {
             eprintln!("journal trusted_root differs from the requested one")
         }
+        Verdict::StateNotOk => eprintln!(
+            "NOT OK: the committed state section is not what was asked for (state_checked={}, state_ok={}, error code {})",
+            out.state_checked, out.state_ok, out.state_error_code
+        ),
         Verdict::NotOk => eprintln!("NOT OK"),
     }
     ExitCode::from(verdict_exit_code(&verdict))

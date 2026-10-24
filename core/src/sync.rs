@@ -414,6 +414,7 @@ pub fn is_better_update(
     old: &LightClientUpdate,
     cfg: &SyncConfig,
 ) -> bool {
+    use core::cmp::Ordering;
     let new_active = count_bits(new.sync_committee_bits);
     let old_active = count_bits(old.sync_committee_bits);
     // Both updates were validated against the same committee, so their bitfield lengths match.
@@ -422,8 +423,12 @@ pub fn is_better_update(
     if new_super != old_super {
         return new_super;
     }
-    if !new_super && new_active != old_active {
-        return new_active > old_active;
+    if !new_super {
+        match new_active.cmp(&old_active) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
     }
 
     let relevant = |u: &LightClientUpdate| {
@@ -451,11 +456,16 @@ pub fn is_better_update(
         }
     }
 
-    if new_active != old_active {
-        return new_active > old_active;
+    match new_active.cmp(&old_active) {
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
     }
-    if new.attested_header.slot != old.attested_header.slot {
-        return new.attested_header.slot < old.attested_header.slot;
+    // an earlier attested header is better
+    match new.attested_header.slot.cmp(&old.attested_header.slot) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
     }
     new.signature_slot < old.signature_slot
 }

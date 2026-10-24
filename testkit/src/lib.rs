@@ -13,6 +13,8 @@ use le_sync_core::sync::SyncCommittee;
 use le_sync_core::{hash_pair, sync_committee_root, BlsPubkey, Bytes32};
 use sha2::{Digest, Sha256};
 
+pub mod trie;
+
 /// Ethereum BLS ciphersuite. Duplicated on purpose; `wire` tests assert it equals `bls::DST`.
 pub const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
