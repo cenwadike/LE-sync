@@ -1,10 +1,14 @@
-//! Generic Merkle-Patricia-trie proof verifier for Ethereum's secure tries (`no_std`, no alloc).
+//! Generic Merkle-Patricia-trie proof verifier (`no_std`, no alloc), one walk, two key modes:
 //!
-//! Used for the account trie and storage trie (Sprint 4) and, with the same walk, the
-//! receipts trie (Sprint 5). The key is always the 32-byte hashed key (64 nibbles), which
-//! is what the "secure" state and storage tries use; the receipts trie keys are RLP-encoded
-//! indices, not hashes, so Sprint 5 needs either a variable-length key entry point or a
-//! padded form: this file does not pretend to cover that yet.
+//! * Hashed key (`verify_proof`): the "secure" state and storage tries (Sprint 4). The key is
+//!   the 32-byte keccak hash, 64 nibbles.
+//! * Raw `rlp(index)` key (`verify_index_proof`): the receipts trie and the transactions trie
+//!   (Sprint 5). The key is the RLP encoding of the item's position in the block, not a hash.
+//!   It is 1 to 9 bytes long, so 2 to 18 nibbles. EIP-2718: the receipts root is
+//!   `patriciaTrie(rlp(Index) => Receipt)`.
+//!
+//! No `rlp(index)` key is a prefix of another, so a branch value slot is never used in those
+//! tries; the walk still handles it, as it does for any trie.
 //!
 //! Proof format is the `eth_getProof` one: the list of RLP-encoded nodes on the path from
 //! the root, root first. Nodes whose encoding is shorter than 32 bytes are embedded in their
@@ -37,7 +41,7 @@ enum NodeRef<'a> {
     Inline(&'a [u8]),
 }
 
-fn nibble(key: &Bytes32, pos: usize) -> u8 {
+fn nibble(key: &[u8], pos: usize) -> u8 {
     let b = key[pos / 2];
     if pos % 2 == 0 {
         b >> 4
@@ -102,9 +106,9 @@ impl HexPrefix<'_> {
         }
     }
     /// Does the path equal the key nibbles starting at `pos`? `false` if the key is too short.
-    fn matches(&self, key: &Bytes32, pos: usize) -> bool {
+    fn matches(&self, key: &[u8], pos: usize) -> bool {
         let n = self.len();
-        if pos + n > KEY_NIBBLES {
+        if pos + n > key.len() * 2 {
             return false;
         }
         (0..n).all(|i| self.at(i) == nibble(key, pos + i))
@@ -128,11 +132,57 @@ fn child_ref<'a>(item: Item<'a>) -> Result<Option<NodeRef<'a>>, Error> {
 }
 
 /// Verify `nodes` as a proof for `key` (a 32-byte hashed key) under `root`.
+/// Secure tries: account and storage.
 pub fn verify_proof<'a, N: AsRef<[u8]>>(
     root: &Bytes32,
     key: &Bytes32,
     nodes: &'a [N],
 ) -> Result<Option<&'a [u8]>, Error> {
+    walk(root, key, nodes)
+}
+
+/// Verify `nodes` as a proof for the item at position `index` under `root`. The key is
+/// `rlp(index)`, not hashed. Receipts and transactions tries.
+///
+/// `Ok(None)` is a valid proof that no item sits at `index`. A caller that needs the item
+/// must treat it as a failure.
+pub fn verify_index_proof<'a, N: AsRef<[u8]>>(
+    root: &Bytes32,
+    index: u64,
+    nodes: &'a [N],
+) -> Result<Option<&'a [u8]>, Error> {
+    let mut buf = [0u8; 9];
+    walk(root, rlp_index(index, &mut buf), nodes)
+}
+
+/// RLP encoding of an unsigned integer used as a trie key: `0` is `0x80` (the empty string),
+/// `1..=0x7f` is the byte itself, anything larger is `0x80 + n` then `n` big-endian bytes
+/// with no leading zero (`n <= 8`, so the short length form always applies).
+fn rlp_index(index: u64, buf: &mut [u8; 9]) -> &[u8] {
+    if index == 0 {
+        buf[0] = 0x80;
+        return &buf[..1];
+    }
+    if index < 0x80 {
+        buf[0] = index as u8;
+        return &buf[..1];
+    }
+    let be = index.to_be_bytes();
+    let skip = (index.leading_zeros() / 8) as usize;
+    let n = 8 - skip;
+    buf[0] = 0x80 + n as u8;
+    buf[1..=n].copy_from_slice(&be[skip..]);
+    &buf[..=n]
+}
+
+/// The walk shared by both key modes. `key` is the whole key in bytes; the path is
+/// `2 * key.len()` nibbles.
+fn walk<'a, N: AsRef<[u8]>>(
+    root: &Bytes32,
+    key: &[u8],
+    nodes: &'a [N],
+) -> Result<Option<&'a [u8]>, Error> {
+    let total = key.len() * 2;
     // An empty trie proves absence of everything and has no nodes.
     if *root == EMPTY_TRIE_ROOT && nodes.is_empty() {
         return Ok(None);
@@ -158,7 +208,7 @@ pub fn verify_proof<'a, N: AsRef<[u8]>>(
         let (items, count) = split_list::<17>(payload)?;
         match count {
             17 => {
-                if pos == KEY_NIBBLES {
+                if pos == total {
                     // key ends at a branch: its value slot decides
                     let v = items[16].as_bytes()?;
                     break if v.is_empty() { None } else { Some(v) };
@@ -178,8 +228,8 @@ pub fn verify_proof<'a, N: AsRef<[u8]>>(
                 }
                 pos += hp.len();
                 if hp.is_leaf {
-                    // a leaf fully consumes a fixed-length key
-                    if pos != KEY_NIBBLES {
+                    // a leaf fully consumes the key
+                    if pos != total {
                         return Err(Error::InvalidTrieProof);
                     }
                     break Some(items[1].as_bytes()?);
@@ -252,8 +302,20 @@ pub(crate) mod testutil {
         }
         out
     }
-    fn to_nibs(k: &Bytes32) -> Vec<u8> {
+    fn to_nibs(k: &[u8]) -> Vec<u8> {
         k.iter().flat_map(|b| [b >> 4, b & 0xf]).collect()
+    }
+
+    /// `rlp(index)` as a trie key, built from the oracle's own RLP: the minimal big-endian
+    /// bytes of `index` (none for 0) as an RLP string.
+    pub fn index_key(index: u64) -> Vec<u8> {
+        let be: Vec<u8> = index
+            .to_be_bytes()
+            .iter()
+            .copied()
+            .skip_while(|b| *b == 0)
+            .collect();
+        rlp_bytes(&be)
     }
 
     /// Encoded node for `entries` (suffix-nibbles -> value), all sharing the consumed prefix.
@@ -306,10 +368,19 @@ pub(crate) mod testutil {
 
     pub struct Trie {
         pub root: Bytes32,
-        map: BTreeMap<Bytes32, Vec<u8>>,
+        map: BTreeMap<Vec<u8>, Vec<u8>>,
     }
     impl Trie {
+        /// Secure trie: 32-byte keys.
         pub fn new(entries: &[(Bytes32, Vec<u8>)]) -> Trie {
+            let raw: Vec<_> = entries
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.clone()))
+                .collect();
+            Trie::new_raw(&raw)
+        }
+        /// Keys of any length, none a prefix of another (e.g. `index_key`).
+        pub fn new_raw(entries: &[(Vec<u8>, Vec<u8>)]) -> Trie {
             let map: BTreeMap<_, _> = entries.iter().cloned().collect();
             if map.is_empty() {
                 return Trie {
@@ -326,6 +397,9 @@ pub(crate) mod testutil {
         }
         /// Proof for `key`: walk the structure, collecting hashed (non-embedded) nodes.
         pub fn prove(&self, key: &Bytes32) -> Vec<Vec<u8>> {
+            self.prove_raw(key)
+        }
+        pub fn prove_raw(&self, key: &[u8]) -> Vec<Vec<u8>> {
             if self.map.is_empty() {
                 return vec![];
             }
@@ -714,5 +788,194 @@ mod tests {
         );
         // empty slot inside the embedded branch: a verified exclusion
         assert_eq!(verify_proof(&t.root, &c, &t.prove(&c)), Ok(None));
+    }
+    // ---- raw `rlp(index)` keys: receipts and transactions tries ----
+
+    fn rval(i: u64) -> Vec<u8> {
+        // distinct per index, long enough that leaves are hashed
+        let mut v = vec![0xab; 70];
+        v[..8].copy_from_slice(&i.to_be_bytes());
+        v
+    }
+    fn rtrie(n: u64) -> Trie {
+        Trie::new_raw(&(0..n).map(|i| (index_key(i), rval(i))).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn rlp_index_matches_the_independent_encoding() {
+        let mut buf = [0u8; 9];
+        // pinned literals
+        assert_eq!(rlp_index(0, &mut buf), &[0x80]);
+        assert_eq!(rlp_index(1, &mut buf), &[0x01]);
+        assert_eq!(rlp_index(0x7f, &mut buf), &[0x7f]);
+        assert_eq!(rlp_index(0x80, &mut buf), &[0x81, 0x80]);
+        assert_eq!(rlp_index(0xff, &mut buf), &[0x81, 0xff]);
+        assert_eq!(rlp_index(0x100, &mut buf), &[0x82, 0x01, 0x00]);
+        assert_eq!(
+            rlp_index(u64::MAX, &mut buf),
+            &[0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+        );
+        // against the oracle: a dense range and every length boundary
+        for i in 0..600u64 {
+            assert_eq!(rlp_index(i, &mut buf), &index_key(i)[..], "i={i}");
+        }
+        for sh in 0..64u32 {
+            for i in [(1u64 << sh) - 1, 1u64 << sh, (1u64 << sh) + 1] {
+                assert_eq!(rlp_index(i, &mut buf), &index_key(i)[..], "i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_single_leaf_trie() {
+        // index 0 has key 0x80: nibbles [8, 0]
+        let leaf = rlp_list(&[rlp_bytes(&[0x20, 0x80]), rlp_bytes(&rval(0))]);
+        let t = Trie::new_raw(&[(index_key(0), rval(0))]);
+        assert_eq!(t.root, keccak256(&leaf));
+        assert_eq!(t.prove_raw(&index_key(0)), vec![leaf.clone()]);
+        assert_eq!(
+            verify_index_proof(&t.root, 0, &[leaf.clone()]),
+            Ok(Some(&rval(0)[..]))
+        );
+        // another index diverges from the leaf path: a verified absence
+        assert_eq!(verify_index_proof(&t.root, 1, &[leaf.clone()]), Ok(None));
+        assert_eq!(verify_index_proof(&t.root, 128, &[leaf]), Ok(None));
+        // index 5 has key 0x05: nibbles [0, 5]
+        let leaf = rlp_list(&[rlp_bytes(&[0x20, 0x05]), rlp_bytes(&rval(5))]);
+        let t = Trie::new_raw(&[(index_key(5), rval(5))]);
+        assert_eq!(t.root, keccak256(&leaf));
+        assert_eq!(
+            verify_index_proof(&t.root, 5, &[leaf]),
+            Ok(Some(&rval(5)[..]))
+        );
+    }
+
+    #[test]
+    fn raw_leaf_must_consume_the_whole_key() {
+        // index 0 is two nibbles; a leaf with a one-nibble path ends early
+        let leaf = rlp_list(&[rlp_bytes(&hp(&[8], true)), rlp_bytes(&rval(0))]);
+        let root = keccak256(&leaf);
+        assert_eq!(
+            verify_index_proof(&root, 0, &[leaf]),
+            Err(Error::InvalidTrieProof)
+        );
+    }
+
+    #[test]
+    fn raw_inclusion_for_every_index_and_absence_beyond() {
+        // sizes straddle the 0x80 / 0x100 key-length boundaries
+        for n in [1u64, 2, 3, 16, 17, 127, 128, 129, 300] {
+            let t = rtrie(n);
+            let idx: Vec<u64> = if n <= 129 {
+                (0..n).collect()
+            } else {
+                vec![0, 1, 2, 127, 128, 129, 255, 256, 257, n - 1]
+            };
+            for i in idx {
+                let p = t.prove_raw(&index_key(i));
+                assert_eq!(
+                    verify_index_proof(&t.root, i, &p),
+                    Ok(Some(&rval(i)[..])),
+                    "n={n} i={i}"
+                );
+            }
+            for i in [n, n + 1, 1000, 70_000, u64::MAX] {
+                let p = t.prove_raw(&index_key(i));
+                assert_eq!(verify_index_proof(&t.root, i, &p), Ok(None), "n={n} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_embedded_nodes_down_to_the_last_nibble() {
+        // 1-byte values: every node below the root is shorter than 32 bytes and embedded, so
+        // the proof is the root alone. Keys 0x80, 0x01, 0x02.
+        let t = Trie::new_raw(&[
+            (index_key(0), vec![1]),
+            (index_key(1), vec![2]),
+            (index_key(2), vec![3]),
+        ]);
+        for (i, v) in [(0u64, 1u8), (1, 2), (2, 3)] {
+            let p = t.prove_raw(&index_key(i));
+            assert_eq!(p.len(), 1);
+            assert_eq!(verify_index_proof(&t.root, i, &p), Ok(Some(&[v][..])));
+        }
+        // empty slot inside the embedded branch
+        let p = t.prove_raw(&index_key(3));
+        assert_eq!(verify_index_proof(&t.root, 3, &p), Ok(None));
+    }
+
+    #[test]
+    fn raw_wrong_index_is_never_accepted() {
+        let t = rtrie(40);
+        for i in 0..40u64 {
+            let p = t.prove_raw(&index_key(i));
+            for j in 0..40u64 {
+                if i != j {
+                    assert_eq!(
+                        verify_index_proof(&t.root, j, &p),
+                        Err(Error::InvalidTrieProof),
+                        "proof for {i} used for {j}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_tamper_wrong_root_truncated_extra_and_flipped() {
+        let t = rtrie(20);
+        let p = t.prove_raw(&index_key(7));
+        assert!(p.len() >= 2);
+        let mut r = t.root;
+        r[0] ^= 1;
+        assert_eq!(verify_index_proof(&r, 7, &p), Err(Error::InvalidTrieProof));
+        assert_eq!(
+            verify_index_proof(&t.root, 7, &p[..p.len() - 1]),
+            Err(Error::InvalidTrieProof)
+        );
+        let mut extra = p.clone();
+        extra.push(p[0].clone());
+        assert_eq!(
+            verify_index_proof(&t.root, 7, &extra),
+            Err(Error::InvalidTrieProof)
+        );
+        for n in 0..p.len() {
+            for b in 0..p[n].len() {
+                let mut bad = p.clone();
+                bad[n][b] ^= 1;
+                assert_ne!(
+                    verify_index_proof(&t.root, 7, &bad),
+                    Ok(Some(&rval(7)[..])),
+                    "node {n} byte {b} accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hashed_and_raw_proofs_are_not_interchangeable() {
+        // a secure-trie proof under raw mode
+        let secure = trie(20);
+        for i in 0..20u64 {
+            let p = secure.prove(&key(i));
+            let got = verify_index_proof(&secure.root, i, &p);
+            assert!(!matches!(got, Ok(Some(_))), "secure proof accepted, i={i}");
+        }
+        // a single-entry secure trie: a 64-nibble leaf can never match a short raw key
+        let one = Trie::new(&[(key(0), val(0))]);
+        let p = one.prove(&key(0));
+        assert_eq!(verify_index_proof(&one.root, 0, &p), Ok(None));
+        // a raw-trie proof under secure mode, with the key padded or hashed
+        let raw = rtrie(20);
+        for i in 0..20u64 {
+            let p = raw.prove_raw(&index_key(i));
+            let mut padded = [0u8; 32];
+            padded[..index_key(i).len()].copy_from_slice(&index_key(i));
+            for k in [padded, keccak256(&index_key(i))] {
+                let got = verify_proof(&raw.root, &k, &p);
+                assert!(!matches!(got, Ok(Some(_))), "raw proof accepted, i={i}");
+            }
+        }
     }
 }

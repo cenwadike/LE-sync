@@ -1,7 +1,9 @@
 //! Test-only: a naive reference Merkle-Patricia trie builder with proof extraction, the oracle
 //! for `le_sync_core::mpt::verify_proof` and the account/storage layers. It shares no code with
 //! the verifier beyond keccak; RLP length prefixes are implemented independently here.
-//! Keys are 32-byte hashed keys (64 nibbles), like the secure state and storage tries.
+//! `Trie::new` / `prove` take 32-byte hashed keys (64 nibbles), like the secure state and
+//! storage tries. `Trie::new_raw` / `prove_raw` take keys of any length, none a prefix of
+//! another: the receipts and transactions tries, keyed by `index_key(i) = rlp(i)`.
 //!
 //! NOTE: this is a copy of the builder in `core/src/mpt.rs` (`testutil`, `cfg(test)`-private).
 //! Keep the two in sync, or point core's tests at this crate and delete the copy.
@@ -54,8 +56,20 @@ pub fn hp(nibs: &[u8], leaf: bool) -> Vec<u8> {
     }
     out
 }
-fn to_nibs(k: &Bytes32) -> Vec<u8> {
+fn to_nibs(k: &[u8]) -> Vec<u8> {
     k.iter().flat_map(|b| [b >> 4, b & 0xf]).collect()
+}
+
+/// `rlp(index)` as a trie key, built from this file's own RLP: the minimal big-endian bytes of
+/// `index` (none for 0) as an RLP string. Index 0 is `0x80`.
+pub fn index_key(index: u64) -> Vec<u8> {
+    let be: Vec<u8> = index
+        .to_be_bytes()
+        .iter()
+        .copied()
+        .skip_while(|b| *b == 0)
+        .collect();
+    rlp_bytes(&be)
 }
 
 /// Encoded node for `entries` (suffix-nibbles -> value), all sharing the consumed prefix.
@@ -108,10 +122,19 @@ fn child_ref(enc: &[u8]) -> Vec<u8> {
 
 pub struct Trie {
     pub root: Bytes32,
-    map: BTreeMap<Bytes32, Vec<u8>>,
+    map: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 impl Trie {
+    /// Secure trie: 32-byte keys.
     pub fn new(entries: &[(Bytes32, Vec<u8>)]) -> Trie {
+        let raw: Vec<_> = entries
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect();
+        Trie::new_raw(&raw)
+    }
+    /// Keys of any length, none a prefix of another (e.g. `index_key`).
+    pub fn new_raw(entries: &[(Vec<u8>, Vec<u8>)]) -> Trie {
         let map: BTreeMap<_, _> = entries.iter().cloned().collect();
         if map.is_empty() {
             return Trie {
@@ -128,6 +151,9 @@ impl Trie {
     }
     /// Proof for `key`: walk the structure, collecting hashed (non-embedded) nodes.
     pub fn prove(&self, key: &Bytes32) -> Vec<Vec<u8>> {
+        self.prove_raw(key)
+    }
+    pub fn prove_raw(&self, key: &[u8]) -> Vec<Vec<u8>> {
         if self.map.is_empty() {
             return vec![];
         }

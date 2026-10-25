@@ -7,7 +7,8 @@
 //! (see `ExecutionPayloadHeader` and `sync::verify_execution_branch`).
 
 use crate::keccak::{keccak256, EMPTY_CODE_HASH, EMPTY_TRIE_ROOT};
-use crate::mpt::verify_proof;
+use crate::mpt::{verify_index_proof, verify_proof};
+use crate::receipt::{select_log, Log, LogFilter};
 use crate::rlp::{canonical_uint, decode_exact, split_list, Item};
 use crate::{Bytes32, Error};
 
@@ -147,10 +148,26 @@ pub fn verify_state<N: AsRef<[u8]>, M: AsRef<[u8]>>(
     }
 }
 
+/// Verify a log under `receipts_root`: the receipt at `tx_index` is proven by `proof`
+/// (receipts-trie nodes, root first), then its `log_index`-th log must match `filter`.
+///
+/// `receipts_root` must come from an anchored header (`exec::anchor_execution`). No receipt at
+/// `tx_index` is `LogMismatch`, never a success. The returned log borrows from `proof`.
+pub fn verify_log<'a, N: AsRef<[u8]>>(
+    receipts_root: &Bytes32,
+    tx_index: u64,
+    proof: &'a [N],
+    log_index: usize,
+    filter: &LogFilter,
+) -> Result<Log<'a>, Error> {
+    let receipt = verify_index_proof(receipts_root, tx_index, proof)?.ok_or(Error::LogMismatch)?;
+    select_log(receipt, log_index, filter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mpt::testutil::{rlp_bytes, rlp_list, Trie};
+    use crate::mpt::testutil::{index_key, rlp_bytes, rlp_list, Trie};
 
     fn trim(b: &[u8]) -> Vec<u8> {
         let i = b.iter().position(|x| *x != 0).unwrap_or(b.len());
@@ -383,5 +400,149 @@ mod tests {
         assert_eq!(account_key(&[0u8; 20]), keccak256(&[0u8; 20]));
         assert_eq!(storage_key(&[0u8; 32]), keccak256(&[0u8; 32]));
         assert_ne!(account_key(&addr(1)), account_key(&addr(2)));
+    }
+    // ---- log proofs (receipts trie) ----
+
+    fn log_rlp(a: u8, topic: u8) -> Vec<u8> {
+        rlp_list(&[
+            rlp_bytes(&[a; 20]),
+            rlp_list(&[
+                rlp_bytes(&[topic; 32]),
+                rlp_bytes(&[topic.wrapping_add(1); 32]),
+            ]),
+            rlp_bytes(&[topic; 32]),
+        ])
+    }
+    /// A typed (0x02) receipt whose single log is `log_rlp(a, topic)`.
+    fn receipt_leaf(status: &[u8], a: u8, topic: u8) -> Vec<u8> {
+        let mut v = vec![0x02];
+        v.extend(rlp_list(&[
+            rlp_bytes(status),
+            rlp_bytes(&[0x52, 0x08]),
+            rlp_bytes(&[0u8; 256]),
+            rlp_list(&[log_rlp(a, topic)]),
+        ]));
+        v
+    }
+    /// A block of `n` receipts; transaction `i` logs topic `i as u8`.
+    fn receipts_trie(n: u64) -> Trie {
+        Trie::new_raw(
+            &(0..n)
+                .map(|i| (index_key(i), receipt_leaf(&[1], 0xA1, i as u8)))
+                .collect::<Vec<_>>(),
+        )
+    }
+    fn filter(a: u8, topic: u8) -> LogFilter {
+        LogFilter {
+            address: [a; 20],
+            topics: [Some([topic; 32]), None, None, None],
+        }
+    }
+
+    #[test]
+    fn a_log_verifies_at_indexes_below_and_above_128() {
+        let t = receipts_trie(300);
+        for i in [0u64, 1, 2, 127, 128, 129, 255, 256, 299] {
+            let proof = t.prove_raw(&index_key(i));
+            let l = verify_log(&t.root, i, &proof, 0, &filter(0xA1, i as u8)).unwrap();
+            assert_eq!(l.address, [0xA1; 20], "tx {i}");
+            assert_eq!(l.topics[0], [i as u8; 32]);
+            assert_eq!(l.topics[1], [(i as u8).wrapping_add(1); 32]);
+            assert_eq!(l.data, &[i as u8; 32][..]);
+        }
+    }
+
+    #[test]
+    fn a_wrong_transaction_index_does_not_verify() {
+        let t = receipts_trie(20);
+        let proof = t.prove_raw(&index_key(7));
+        for j in (0..20u64).filter(|j| *j != 7) {
+            assert_eq!(
+                verify_log(&t.root, j, &proof, 0, &filter(0xA1, 7)),
+                Err(Error::InvalidTrieProof),
+                "tx {j}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_receipt_at_the_index_is_logmismatch() {
+        let t = receipts_trie(20);
+        for i in [20u64, 21, 1000] {
+            let proof = t.prove_raw(&index_key(i));
+            assert_eq!(
+                verify_log(&t.root, i, &proof, 0, &filter(0xA1, 0)),
+                Err(Error::LogMismatch),
+                "tx {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_filter_log_index_and_status_failures() {
+        let t = receipts_trie(20);
+        let proof = t.prove_raw(&index_key(7));
+        // wrong address, wrong topic, log index beyond the receipt's one log
+        assert_eq!(
+            verify_log(&t.root, 7, &proof, 0, &filter(0xB2, 7)),
+            Err(Error::LogMismatch)
+        );
+        assert_eq!(
+            verify_log(&t.root, 7, &proof, 0, &filter(0xA1, 8)),
+            Err(Error::LogMismatch)
+        );
+        assert_eq!(
+            verify_log(&t.root, 7, &proof, 1, &filter(0xA1, 7)),
+            Err(Error::LogMismatch)
+        );
+        // a failed transaction (status 0) in the trie
+        let failed = Trie::new_raw(&[
+            (index_key(0), receipt_leaf(&[1], 0xA1, 0)),
+            (index_key(1), receipt_leaf(&[], 0xA1, 1)),
+        ]);
+        let proof = failed.prove_raw(&index_key(1));
+        assert_eq!(
+            verify_log(&failed.root, 1, &proof, 0, &filter(0xA1, 1)),
+            Err(Error::LogMismatch)
+        );
+    }
+
+    #[test]
+    fn tampered_receipt_proofs_are_rejected() {
+        let t = receipts_trie(20);
+        let proof = t.prove_raw(&index_key(7));
+        let f = filter(0xA1, 7);
+        assert!(verify_log(&t.root, 7, &proof, 0, &f).is_ok());
+        // wrong root
+        let mut r = t.root;
+        r[0] ^= 1;
+        assert_eq!(
+            verify_log(&r, 7, &proof, 0, &f),
+            Err(Error::InvalidTrieProof)
+        );
+        // any flipped byte of any node: never the original log
+        let good = verify_log(&t.root, 7, &proof, 0, &f).unwrap();
+        for n in 0..proof.len() {
+            for b in 0..proof[n].len() {
+                let mut bad = proof.clone();
+                bad[n][b] ^= 1;
+                assert_ne!(
+                    verify_log(&t.root, 7, &bad, 0, &f),
+                    Ok(good),
+                    "node {n} byte {b}"
+                );
+            }
+        }
+        // truncated and surplus nodes
+        assert_eq!(
+            verify_log(&t.root, 7, &proof[..proof.len() - 1], 0, &f),
+            Err(Error::InvalidTrieProof)
+        );
+        let mut extra = proof.clone();
+        extra.push(proof[0].clone());
+        assert_eq!(
+            verify_log(&t.root, 7, &extra, 0, &f),
+            Err(Error::InvalidTrieProof)
+        );
     }
 }

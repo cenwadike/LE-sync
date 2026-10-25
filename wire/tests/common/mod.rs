@@ -141,6 +141,8 @@ impl Baseline {
                 boot_branch: boot_state.cur_branch,
                 finality: vec![],
                 sync: None,
+                state: None,
+                log: None,
             },
             cur,
             next,

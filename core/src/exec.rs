@@ -128,6 +128,32 @@ pub fn verify_execution_anchor(
     exec: &ExecutionPayloadHeader,
     execution_branch: &[Bytes32],
 ) -> Result<Bytes32, Error> {
+    anchor_execution(cfg, finalized, exec, execution_branch).map(|a| a.state_root)
+}
+
+/// The fields of an execution header that `anchor_execution` has tied to a finalized beacon
+/// header. Callers read the roots they prove against from here, never from the unverified
+/// `ExecutionPayloadHeader` they were handed.
+///
+/// `transactions_root` is not included: in this header it is an SSZ root, not the
+/// Merkle-Patricia transactions root, so it does not serve an MPT proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchoredExecution {
+    /// Root of the account trie: account and storage proofs.
+    pub state_root: Bytes32,
+    /// Root of the receipts trie (`patriciaTrie(rlp(index) => receipt)`): log proofs.
+    pub receipts_root: Bytes32,
+    pub block_hash: Bytes32,
+    pub block_number: u64,
+}
+
+/// Same checks as `verify_execution_anchor`; returns every verified field a proof needs.
+pub fn anchor_execution(
+    cfg: &ChainConfig,
+    finalized: &BeaconBlockHeader,
+    exec: &ExecutionPayloadHeader,
+    execution_branch: &[Bytes32],
+) -> Result<AnchoredExecution, Error> {
     // Also rejects slots_per_epoch == 0 (BadConfig) and the Gloas era (UnsupportedFork).
     cfg.gindices_at_slot(finalized.slot)?;
     if finalized.slot / cfg.slots_per_epoch < cfg.electra_fork_epoch {
@@ -135,7 +161,12 @@ pub fn verify_execution_anchor(
     }
     let root = exec.hash_tree_root().ok_or(Error::InvalidBranch)?;
     verify_execution_branch(finalized, execution_branch, &root)?;
-    Ok(exec.state_root)
+    Ok(AnchoredExecution {
+        state_root: exec.state_root,
+        receipts_root: exec.receipts_root,
+        block_hash: exec.block_hash,
+        block_number: exec.block_number,
+    })
 }
 
 #[cfg(test)]
@@ -192,7 +223,8 @@ mod tests {
         x.finalize().into()
     }
 
-    fn oracle(h: &ExecutionPayloadHeader) -> Bytes32 {
+    /// The 17 field chunks, padded to 32, in spec order.
+    fn leaves(h: &ExecutionPayloadHeader) -> Vec<Bytes32> {
         let pad = |b: &[u8]| {
             let mut c = [0u8; 32];
             c[..b.len()].copy_from_slice(b);
@@ -223,7 +255,11 @@ mod tests {
             pad(&h.excess_blob_gas.to_le_bytes()),
         ];
         leaves.resize(32, [0u8; 32]);
-        rec(&leaves)
+        leaves
+    }
+
+    fn oracle(h: &ExecutionPayloadHeader) -> Bytes32 {
+        rec(&leaves(h))
     }
 
     #[test]
@@ -277,6 +313,29 @@ mod tests {
         for (i, h) in variants.iter().enumerate() {
             assert_ne!(h.hash_tree_root(), Some(r0), "variant {i}");
         }
+    }
+
+    #[test]
+    fn anchored_fields_sit_at_their_spec_leaf_positions() {
+        // consensus-specs order: state_root 2, receipts_root 3, block_number 6, block_hash 12
+        let h = sample(9);
+        let l = leaves(&h);
+        assert_eq!(l.len(), 32);
+        assert_eq!(l[2], h.state_root);
+        assert_eq!(l[3], h.receipts_root);
+        assert_eq!(l[6][..8], h.block_number.to_le_bytes());
+        assert_eq!(l[12], h.block_hash);
+        // and the production root follows that order: moving one value changes only that leaf
+        let mut m = h;
+        m.receipts_root = [0xEE; 32];
+        let mut l2 = l.clone();
+        l2[3] = [0xEE; 32];
+        assert_eq!(m.hash_tree_root(), Some(rec(&l2)));
+        let mut m = h;
+        m.block_hash = [0xEE; 32];
+        let mut l2 = l;
+        l2[12] = [0xEE; 32];
+        assert_eq!(m.hash_tree_root(), Some(rec(&l2)));
     }
 
     #[test]
@@ -338,6 +397,53 @@ mod tests {
         let (h, br) = anchor_fixture(20 * 32, &e);
         assert_eq!(br.len(), 4);
         assert_eq!(verify_execution_anchor(&CFG, &h, &e, &br), Ok(e.state_root));
+    }
+
+    #[test]
+    fn anchor_execution_returns_exactly_the_verified_fields() {
+        let e = sample(3);
+        let (h, br) = anchor_fixture(20 * 32, &e);
+        let a = anchor_execution(&CFG, &h, &e, &br).unwrap();
+        assert_eq!(a.state_root, e.state_root);
+        assert_eq!(a.receipts_root, e.receipts_root);
+        assert_eq!(a.block_hash, e.block_hash);
+        assert_eq!(a.block_number, e.block_number);
+        // the sample's values differ, so a swapped field cannot pass the checks above
+        assert_ne!(a.state_root, a.receipts_root);
+        assert_ne!(a.receipts_root, a.block_hash);
+        assert_ne!(a.state_root, a.block_hash);
+        // the older entry point returns the same state root
+        assert_eq!(verify_execution_anchor(&CFG, &h, &e, &br), Ok(a.state_root));
+    }
+
+    #[test]
+    fn forged_receipts_root_block_hash_and_number_do_not_anchor() {
+        let e = sample(3);
+        let (h, br) = anchor_fixture(20 * 32, &e);
+        let mut f = e;
+        f.receipts_root = [0xEE; 32];
+        assert_eq!(
+            anchor_execution(&CFG, &h, &f, &br),
+            Err(Error::InvalidBranch)
+        );
+        let mut f = e;
+        f.block_hash = [0xEE; 32];
+        assert_eq!(
+            anchor_execution(&CFG, &h, &f, &br),
+            Err(Error::InvalidBranch)
+        );
+        let mut f = e;
+        f.block_number += 1;
+        assert_eq!(
+            anchor_execution(&CFG, &h, &f, &br),
+            Err(Error::InvalidBranch)
+        );
+        // the fork rules are shared with the older entry point
+        let (h, br) = anchor_fixture(9 * 32, &e);
+        assert_eq!(
+            anchor_execution(&CFG, &h, &e, &br),
+            Err(Error::UnsupportedFork)
+        );
     }
 
     #[test]

@@ -1,13 +1,18 @@
 //! Guest input/output types and `verify`, the whole of what the zkVM guest executes
 //! (bootstrap, finality branches, sync-update validation incl. BLS, chain-binding commitment,
-//! and, Sprint 4, the execution anchor plus account/storage proofs under the finalized header).
+//! and, Sprints 4 and 5, the execution anchor plus account, storage and log proofs under the
+//! finalized header, an optional predicate over the verified value, and statement IDs).
 //! Kept free of risc0 so it runs natively in tests; the guest is a 3-line wrapper.
 //!
 //! serde note: `[u8; 48]` has no serde impl, so pubkeys travel as one flat `Vec<u8>`.
 pub mod bls;
 
-use le_sync_core::exec::{verify_execution_anchor, ExecutionPayloadHeader};
-use le_sync_core::state::{verify_account, verify_storage, Account, Address};
+use le_sync_core::exec::{anchor_execution, verify_execution_anchor, ExecutionPayloadHeader};
+use le_sync_core::keccak::keccak256;
+use le_sync_core::predicate::{Op, Predicate, Subject, Target};
+use le_sync_core::receipt::{LogFilter, MAX_TOPICS};
+use le_sync_core::state::{verify_account, verify_log, verify_storage, Account, Address};
+use le_sync_core::statement::{statement_id, ProofKey};
 use le_sync_core::sync::{
     has_supermajority, initialize_light_client_store, process_light_client_update, Bls,
     ChainBinding, ForkSchedule, LightClientStore, LightClientUpdate, SyncCommittee, SyncConfig,
@@ -195,6 +200,78 @@ pub struct StateInput {
     pub account_proof: Vec<Vec<u8>>,
     /// `eth_getProof` `storageProof[0].proof`: RLP nodes, root first.
     pub storage_proof: Vec<Vec<u8>>,
+    /// Optional predicate over the verified balance or storage value (Sprint 5).
+    pub predicate: Option<PredicateWire>,
+}
+
+/// Wire form of `predicate::Target`. Indices are `u32` so the format does not depend on
+/// the platform's `usize`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PredicateTarget {
+    Balance,
+    StorageValue,
+    Topic(u32),
+    DataWord(u32),
+}
+
+/// Wire form of `predicate::Op`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PredicateOp {
+    Eq,
+    Ne,
+}
+
+/// Wire form of `predicate::Predicate`. Also echoed in the journal, so a consumer can see
+/// exactly which predicate held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PredicateWire {
+    pub target: PredicateTarget,
+    pub op: PredicateOp,
+    pub operand: Bytes32,
+}
+
+impl From<&PredicateWire> for Predicate {
+    fn from(p: &PredicateWire) -> Predicate {
+        Predicate {
+            target: match p.target {
+                PredicateTarget::Balance => Target::Balance,
+                PredicateTarget::StorageValue => Target::StorageValue,
+                PredicateTarget::Topic(i) => Target::Topic(i as usize),
+                PredicateTarget::DataWord(i) => Target::DataWord(i as usize),
+            },
+            op: match p.op {
+                PredicateOp::Eq => Op::Eq,
+                PredicateOp::Ne => Op::Ne,
+            },
+            operand: p.operand,
+        }
+    }
+}
+
+/// Sprint 5 section: one log of one transaction, under the receipts root of the execution
+/// header of the store's FINAL finalized header. As for `StateInput`, there is no root field:
+/// `receipts_root` is read out of `exec` only after `exec` is proven to be that header's
+/// execution payload header. Requires a `sync` section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LogInput {
+    pub exec: ExecWire,
+    pub exec_branch: Vec<Bytes32>,
+    /// Position of the transaction in the block: the key of the receipt is `rlp(tx_index)`.
+    pub tx_index: u64,
+    /// Position of the log within the receipt.
+    pub log_index: u32,
+    /// Receipts-trie nodes for `rlp(tx_index)`, root first.
+    pub receipt_proof: Vec<Vec<u8>>,
+    /// The log must come from this contract ...
+    pub address: Address,
+    /// ... and match these topics (`None` is a wildcard).
+    pub topics: [Option<Bytes32>; MAX_TOPICS],
+    /// Optional predicate over a topic or data word of the verified log.
+    pub predicate: Option<PredicateWire>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +291,8 @@ pub struct GuestInput {
     pub sync: Option<SyncInput>,
     /// Sprint 4: account + storage inclusion under the final finalized header. Needs `sync`.
     pub state: Option<StateInput>,
+    /// Sprint 5: log inclusion under the final finalized header. Needs `sync`.
+    pub log: Option<LogInput>,
 }
 
 /// Committed to the journal. The host trusts only this, not its own re-computation.
@@ -267,6 +346,38 @@ pub struct GuestOutput {
     pub account_present: bool,
     /// Big-endian wei balance of the account; zero when absent.
     pub account_balance: Bytes32,
+    /// Sprint 5. Statement IDs of the verified account and of the verified storage slot (see
+    /// `le_sync_core::statement`). Zero unless `state_ok`.
+    pub account_statement_id: Bytes32,
+    pub state_statement_id: Bytes32,
+    /// The predicate that held over the state, if one was supplied. `None` unless `state_ok`.
+    pub state_predicate: Option<PredicateWire>,
+    /// Sprint 5. A log section was supplied and evaluated against the store's final finalized
+    /// header. Every field below is zero / false / `None` unless `log_ok`.
+    pub log_checked: bool,
+    /// Anchor, receipt proof, log match and (if supplied) predicate all verified.
+    pub log_ok: bool,
+    /// `Error::code()` of the failing stage when `log_checked && !log_ok`, else 0: 201 anchor,
+    /// 203 / 204 receipt shape / proof, 205 no such log, 206 predicate.
+    pub log_error_code: u16,
+    /// Execution block the verified receipt belongs to, from the proven execution header.
+    pub log_block_number: u64,
+    pub log_block_hash: Bytes32,
+    /// The receipts root the proof was checked against. Derived in the guest, never input.
+    pub log_receipts_root: Bytes32,
+    pub log_tx_index: u64,
+    pub log_index: u32,
+    /// The verified log: emitting contract, topics (`log_topics[..log_topic_count]`; the
+    /// rest are zero), and the length and keccak-256 of its data.
+    pub log_address: [u8; 20],
+    pub log_topic_count: u32,
+    pub log_topics: [Bytes32; MAX_TOPICS],
+    pub log_data_len: u64,
+    pub log_data_hash: Bytes32,
+    /// Statement ID of the verified log (see `le_sync_core::statement`).
+    pub log_statement_id: Bytes32,
+    /// The predicate that held over the log, if one was supplied.
+    pub log_predicate: Option<PredicateWire>,
 }
 
 impl GuestOutput {
@@ -540,6 +651,7 @@ fn verify_state_section(
     out: &mut GuestOutput,
 ) {
     out.state_checked = true;
+    let chain_id = out.chain_id;
     let t0 = cc();
     let run = || -> Result<_, Error> {
         // A malformed header cannot hash to anything the beacon header vouches for.
@@ -564,6 +676,17 @@ fn verify_state_section(
             t2 - t1,
             t3 - t2
         ));
+        // Fail closed: a predicate that does not hold means no statement.
+        if let Some(p) = &st.predicate {
+            let subject = match p.target {
+                PredicateTarget::StorageValue => Subject::Storage { value },
+                // balance, and log targets (which find nothing in an account and fail)
+                _ => Subject::Account {
+                    balance: account.balance,
+                },
+            };
+            Predicate::from(p).evaluate(&subject)?;
+        }
         Ok((exec, state_root, account, present, value))
     };
     match run() {
@@ -577,8 +700,104 @@ fn verify_state_section(
             out.state_value = value;
             out.account_present = present;
             out.account_balance = account.balance;
+            out.account_statement_id = statement_id(
+                chain_id,
+                &exec.block_hash,
+                &ProofKey::Account {
+                    address: st.address,
+                },
+            );
+            out.state_statement_id = statement_id(
+                chain_id,
+                &exec.block_hash,
+                &ProofKey::Storage {
+                    address: st.address,
+                    slot: st.slot,
+                },
+            );
+            out.state_predicate = st.predicate;
         }
         Err(e) => out.state_error_code = e.code(),
+    }
+}
+
+/// Sprint 5: the execution anchor, then the receipt proof under its `receipts_root`, then the
+/// log match, then the predicate, all under `finalized` (the store's final finalized header).
+///
+/// Fail closed, as for the state section: on any error only `log_checked` and
+/// `log_error_code` are set. On success the committed values come from the verified header and
+/// the verified receipt, never from the input (the input's `tx_index` and `log_index` are
+/// echoed because the proof verified exactly that position).
+fn verify_log_section(
+    cfg: &ChainConfig,
+    finalized: &BeaconBlockHeader,
+    lg: &LogInput,
+    out: &mut GuestOutput,
+) {
+    out.log_checked = true;
+    let chain_id = out.chain_id;
+    let t0 = cc();
+    let run = || -> Result<_, Error> {
+        let exec = lg.exec.to_header().ok_or(Error::InvalidBranch)?;
+        let anchored = anchor_execution(cfg, finalized, &exec, &lg.exec_branch)?;
+        let t1 = cc();
+        let filter = LogFilter {
+            address: lg.address,
+            topics: lg.topics,
+        };
+        let verified = verify_log(
+            &anchored.receipts_root,
+            lg.tx_index,
+            &lg.receipt_proof,
+            lg.log_index as usize,
+            &filter,
+        )?;
+        let t2 = cc();
+        if let Some(p) = &lg.predicate {
+            Predicate::from(p).evaluate(&Subject::Log(verified))?;
+        }
+        let id = statement_id(
+            chain_id,
+            &anchored.block_hash,
+            &ProofKey::Log {
+                tx_index: lg.tx_index,
+                log_index: u64::from(lg.log_index),
+            },
+        );
+        let t3 = cc();
+        log(&format!(
+            "log cycles: anchor={} receipt_proof_and_match={} predicate_and_id={}",
+            t1 - t0,
+            t2 - t1,
+            t3 - t2
+        ));
+        // `verified` borrows `lg`: copy out what the journal needs
+        Ok((
+            anchored,
+            verified.topics,
+            verified.topic_count,
+            verified.data.len() as u64,
+            keccak256(verified.data),
+            id,
+        ))
+    };
+    match run() {
+        Ok((anchored, topics, topic_count, data_len, data_hash, id)) => {
+            out.log_ok = true;
+            out.log_block_number = anchored.block_number;
+            out.log_block_hash = anchored.block_hash;
+            out.log_receipts_root = anchored.receipts_root;
+            out.log_tx_index = lg.tx_index;
+            out.log_index = lg.log_index;
+            out.log_address = lg.address;
+            out.log_topic_count = topic_count as u32;
+            out.log_topics = topics;
+            out.log_data_len = data_len;
+            out.log_data_hash = data_hash;
+            out.log_statement_id = id;
+            out.log_predicate = lg.predicate;
+        }
+        Err(e) => out.log_error_code = e.code(),
     }
 }
 
@@ -676,8 +895,14 @@ fn verify_inner<B: Bls>(
         // Sprint 4. Only against the store's final finalized header; if the sync setup failed
         // there is no such header and the state section is not evaluated (`state_checked` stays
         // false), so nothing about the state is committed.
-        if let (Some(st), Some(fh)) = (&i.state, final_header) {
-            verify_state_section(&cfg, &fh, st, &mut out);
+        if let Some(fh) = &final_header {
+            if let Some(st) = &i.state {
+                verify_state_section(&cfg, fh, st, &mut out);
+            }
+            // Sprint 5. Same anchor, same rule: no trusted final header, no log section.
+            if let Some(lg) = &i.log {
+                verify_log_section(&cfg, fh, lg, &mut out);
+            }
         }
     }
     out
@@ -800,6 +1025,7 @@ mod tests {
             ],
             sync: None,
             state: None,
+            log: None,
         }
     }
 
@@ -1482,7 +1708,13 @@ mod tests {
 
     /// BeaconBlockBody: 16 padded leaves, `execution_payload` at index 9 (gindex 25, depth 4).
     fn body_tree(exec_root: Bytes32) -> (Bytes32, Vec<Bytes32>) {
-        let mut level: Vec<Bytes32> = (0..16u8).map(|i| [0x40 + i; 32]).collect();
+        body_tree_salted(exec_root, 0)
+    }
+
+    /// Same, with the other body fields changed by `salt`: a different beacon block that carries
+    /// the same execution payload.
+    fn body_tree_salted(exec_root: Bytes32, salt: u8) -> (Bytes32, Vec<Bytes32>) {
+        let mut level: Vec<Bytes32> = (0..16u8).map(|i| [0x40 + i + salt; 32]).collect();
         level[9] = exec_root;
         let (mut idx, mut branch) = (9usize, vec![]);
         while level.len() > 1 {
@@ -1501,6 +1733,7 @@ mod tests {
             slot: SLOT,
             account_proof: w.state.prove(&account_key(&ADDR)),
             storage_proof: w.storage.prove(&storage_key(&SLOT)),
+            predicate: None,
         }
     }
 
@@ -1536,6 +1769,15 @@ mod tests {
                 o.account_balance
             ),
             (0, ZERO, ZERO, [0; 20], ZERO, ZERO, false, ZERO),
+            "{o:?}"
+        );
+        assert_eq!(
+            (
+                o.account_statement_id,
+                o.state_statement_id,
+                o.state_predicate
+            ),
+            (ZERO, ZERO, None),
             "{o:?}"
         );
     }
@@ -1814,5 +2056,471 @@ mod tests {
         let mut bad = w;
         bad.extra_data = vec![9; 33];
         assert_eq!(bad.to_header(), None);
+    }
+    // ==== Sprint 5: log inclusion, predicate, statement ID ======================================
+
+    use le_sync_core::keccak::keccak256 as kec;
+    use le_sync_testkit::trie::index_key;
+
+    const LOG_TX: u64 = 129; // above 127: a two-byte `rlp(index)` key
+    const LOG_ADDR: Address = [0xC0; 20];
+
+    fn topic(n: u8) -> Bytes32 {
+        [n; 32]
+    }
+    /// One log: `LOG_ADDR`, topics [1.., 2.., 3..] (ERC-20 `Transfer` shape), 32 bytes of data.
+    fn log_rlp(tag: u8) -> Vec<u8> {
+        rlp_list(&[
+            rlp_bytes(&LOG_ADDR),
+            rlp_list(&[
+                rlp_bytes(&topic(tag)),
+                rlp_bytes(&topic(tag.wrapping_add(1))),
+                rlp_bytes(&topic(tag.wrapping_add(2))),
+            ]),
+            rlp_bytes(&[tag; 32]),
+        ])
+    }
+    /// Typed (0x02) receipt with the given status and logs.
+    fn receipt_leaf(status: &[u8], logs: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = vec![0x02];
+        v.extend(rlp_list(&[
+            rlp_bytes(status),
+            rlp_bytes(&[0x52, 0x08]),
+            rlp_bytes(&[0u8; 256]),
+            rlp_list(logs),
+        ]));
+        v
+    }
+    /// A block of 200 receipts; transaction `LOG_TX` carries two logs (tags 0x10 and 0x20),
+    /// the others one log with their own tag.
+    fn receipts() -> Trie {
+        Trie::new_raw(
+            &(0..200u64)
+                .map(|n| {
+                    let logs = if n == LOG_TX {
+                        vec![log_rlp(0x10), log_rlp(0x20)]
+                    } else {
+                        vec![log_rlp(n as u8 | 0x80)]
+                    };
+                    (index_key(n), receipt_leaf(&[1], &logs))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn log_input(
+        t: &Trie,
+        exec: &ExecutionPayloadHeader,
+        branch: Vec<Bytes32>,
+        tx: u64,
+        log_index: u32,
+    ) -> LogInput {
+        LogInput {
+            exec: ExecWire::from(exec),
+            exec_branch: branch,
+            tx_index: tx,
+            log_index,
+            receipt_proof: t.prove_raw(&index_key(tx)),
+            address: LOG_ADDR,
+            topics: [Some(topic(0x10)), None, Some(topic(0x12)), None],
+            predicate: None,
+        }
+    }
+
+    /// An honest run with a log section only (no state section).
+    fn log_fixture() -> (GuestInput, Trie) {
+        let t = receipts();
+        let mut exec = exec_for([0x01; 32]);
+        exec.receipts_root = t.root;
+        let (body_root, branch) = body_tree(exec.hash_tree_root().unwrap());
+        let mut i = with_sync(fixture_with_body(0, body_root));
+        i.log = Some(log_input(&t, &exec, branch, LOG_TX, 0));
+        (i, t)
+    }
+
+    fn pred(target: PredicateTarget, op: PredicateOp, operand: Bytes32) -> Option<PredicateWire> {
+        Some(PredicateWire {
+            target,
+            op,
+            operand,
+        })
+    }
+
+    /// A rejected log check commits nothing about the log except the error code.
+    fn assert_log_rejected(o: &GuestOutput, e: Error) {
+        assert!(o.log_checked && !o.log_ok, "{o:?}");
+        assert_eq!(o.log_error_code, e.code(), "{o:?}");
+        assert_eq!(
+            (
+                o.log_block_number,
+                o.log_block_hash,
+                o.log_receipts_root,
+                o.log_tx_index,
+                o.log_index,
+                o.log_address,
+                o.log_topic_count,
+                o.log_topics,
+                o.log_data_len,
+                o.log_data_hash,
+                o.log_statement_id,
+                o.log_predicate
+            ),
+            (0, ZERO, ZERO, 0, 0, [0; 20], 0, [ZERO; 4], 0, ZERO, ZERO, None),
+            "{o:?}"
+        );
+    }
+
+    #[test]
+    fn log_proof_verifies_and_the_journal_commits_the_values() {
+        let (i, t) = log_fixture();
+        let o = run(&i);
+        assert_eq!((o.sync_validated, o.sync_rejected), (1, 0), "{o:?}");
+        assert!(o.log_checked && o.log_ok, "{o:?}");
+        assert_eq!(o.log_error_code, 0);
+        assert_eq!(o.log_block_number, 24_000_123);
+        assert_eq!(o.log_block_hash, [0x57; 32]);
+        assert_eq!(o.log_receipts_root, t.root);
+        assert_eq!((o.log_tx_index, o.log_index), (LOG_TX, 0));
+        assert_eq!(o.log_address, LOG_ADDR);
+        assert_eq!(o.log_topic_count, 3);
+        assert_eq!(o.log_topics, [topic(0x10), topic(0x11), topic(0x12), ZERO]);
+        assert_eq!(o.log_data_len, 32);
+        assert_eq!(o.log_data_hash, kec(&[0x10; 32]));
+        assert_eq!(o.log_predicate, None);
+        // the statement ID is the core one over the proven block hash and the position
+        assert_eq!(
+            o.log_statement_id,
+            statement_id(
+                CHAIN_ID,
+                &[0x57; 32],
+                &ProofKey::Log {
+                    tx_index: LOG_TX,
+                    log_index: 0
+                }
+            )
+        );
+        assert_ne!(o.log_statement_id, ZERO);
+        // no state section was supplied: the state block stays default
+        assert!(!o.state_checked && !o.state_ok);
+        assert_eq!(o.state_error_code, 0);
+        // the trace variant commits the same journal
+        let att = BeaconBlockHeader::from(&i.finality[0].attested).hash_tree_root();
+        assert_eq!(verify_trace(&i, &MockAt(att)).output, o);
+    }
+
+    #[test]
+    fn the_second_log_of_a_receipt_is_selected_by_log_index() {
+        let (mut i, _) = log_fixture();
+        let lg = i.log.as_mut().unwrap();
+        lg.log_index = 1;
+        lg.topics = [Some(topic(0x20)), None, None, None];
+        let o = run(&i);
+        assert!(o.log_ok, "{o:?}");
+        assert_eq!(o.log_index, 1);
+        assert_eq!(o.log_topics[0], topic(0x20));
+        assert_eq!(o.log_data_hash, kec(&[0x20; 32]));
+        // a different log index gives a different statement ID
+        let (first, _) = log_fixture();
+        assert_ne!(o.log_statement_id, run(&first).log_statement_id);
+    }
+
+    #[test]
+    fn the_statement_id_does_not_depend_on_which_finalized_header_vouches() {
+        // the same execution block anchored under a different beacon body keeps its ID
+        let (a, t) = log_fixture();
+        let oa = run(&a);
+        let mut exec = exec_for([0x01; 32]);
+        exec.receipts_root = t.root;
+        // another beacon block: same execution payload, different sibling fields
+        let (body_root, branch) = body_tree_salted(exec.hash_tree_root().unwrap(), 1);
+        let mut b = with_sync(fixture_with_body(0, body_root));
+        b.log = Some(log_input(&t, &exec, branch, LOG_TX, 0));
+        let ob = run(&b);
+        assert!(oa.log_ok && ob.log_ok, "{oa:?} {ob:?}");
+        assert_ne!(oa.finalized_root, ob.finalized_root);
+        assert_eq!(oa.log_statement_id, ob.log_statement_id);
+    }
+
+    #[test]
+    fn log_rejections_carry_their_own_code_and_commit_nothing() {
+        // forged receipts root in the execution header: the anchor rejects it (201)
+        let (mut i, t) = log_fixture();
+        let mut forged = exec_for([0x01; 32]);
+        forged.receipts_root = [0xEE; 32];
+        i.log.as_mut().unwrap().exec = ExecWire::from(&forged);
+        assert_log_rejected(&run(&i), Error::InvalidBranch);
+        // tampered execution branch
+        let (mut i, _) = log_fixture();
+        i.log.as_mut().unwrap().exec_branch[0][0] ^= 1;
+        assert_log_rejected(&run(&i), Error::InvalidBranch);
+        // malformed execution header
+        let (mut i, _) = log_fixture();
+        i.log.as_mut().unwrap().exec.logs_bloom = vec![0; 255];
+        assert_log_rejected(&run(&i), Error::InvalidBranch);
+        // every byte of every receipt-proof node (204)
+        let (i, _) = log_fixture();
+        let n_nodes = i.log.as_ref().unwrap().receipt_proof.len();
+        assert!(n_nodes >= 2);
+        for n in 0..n_nodes {
+            let len = i.log.as_ref().unwrap().receipt_proof[n].len();
+            for b in 0..len {
+                let mut bad = i.clone();
+                bad.log.as_mut().unwrap().receipt_proof[n][b] ^= 1;
+                let o = run(&bad);
+                assert!(o.log_checked && !o.log_ok, "node {n} byte {b}: {o:?}");
+                assert!(
+                    [Error::InvalidTrieProof.code(), Error::InvalidRlp.code()]
+                        .contains(&o.log_error_code),
+                    "node {n} byte {b}: {o:?}"
+                );
+                assert_eq!(o.log_statement_id, ZERO);
+            }
+        }
+        // truncated, surplus and empty proofs
+        let mut bad = i.clone();
+        bad.log.as_mut().unwrap().receipt_proof.pop();
+        assert_log_rejected(&run(&bad), Error::InvalidTrieProof);
+        let mut bad = i.clone();
+        let first = bad.log.as_ref().unwrap().receipt_proof[0].clone();
+        bad.log.as_mut().unwrap().receipt_proof.push(first);
+        assert_log_rejected(&run(&bad), Error::InvalidTrieProof);
+        let mut bad = i.clone();
+        bad.log.as_mut().unwrap().receipt_proof.clear();
+        assert_log_rejected(&run(&bad), Error::InvalidTrieProof);
+        // a proof for another transaction used for this index
+        let mut bad = i.clone();
+        bad.log.as_mut().unwrap().receipt_proof = t.prove_raw(&index_key(LOG_TX + 1));
+        assert_log_rejected(&run(&bad), Error::InvalidTrieProof);
+        // the right proof claimed for another index
+        let mut bad = i.clone();
+        bad.log.as_mut().unwrap().tx_index = LOG_TX + 1;
+        assert_log_rejected(&run(&bad), Error::InvalidTrieProof);
+    }
+
+    #[test]
+    fn log_that_is_not_there_is_logmismatch() {
+        // no receipt at that index (a valid proof of absence)
+        let (mut i, t) = log_fixture();
+        let lg = i.log.as_mut().unwrap();
+        lg.tx_index = 500;
+        lg.receipt_proof = t.prove_raw(&index_key(500));
+        assert_log_rejected(&run(&i), Error::LogMismatch);
+        // log index past the receipt's logs
+        let (mut i, _) = log_fixture();
+        i.log.as_mut().unwrap().log_index = 2;
+        assert_log_rejected(&run(&i), Error::LogMismatch);
+        // wrong emitting address
+        let (mut i, _) = log_fixture();
+        i.log.as_mut().unwrap().address[0] ^= 1;
+        assert_log_rejected(&run(&i), Error::LogMismatch);
+        // wrong topic at each constrained position
+        for pos in [0usize, 2] {
+            let (mut i, _) = log_fixture();
+            let t = i.log.as_mut().unwrap().topics[pos].as_mut().unwrap();
+            t[31] ^= 1;
+            assert_log_rejected(&run(&i), Error::LogMismatch);
+        }
+        // a constraint on a topic the log does not have
+        let (mut i, _) = log_fixture();
+        i.log.as_mut().unwrap().topics[3] = Some(topic(0));
+        assert_log_rejected(&run(&i), Error::LogMismatch);
+        // a failed transaction has no log
+        let mut es: Vec<(Vec<u8>, Vec<u8>)> = (0..3u64)
+            .map(|n| (index_key(n), receipt_leaf(&[1], &[log_rlp(0x10)])))
+            .collect();
+        es[1].1 = receipt_leaf(&[], &[log_rlp(0x10)]);
+        let t = Trie::new_raw(&es);
+        let mut exec = exec_for([0x01; 32]);
+        exec.receipts_root = t.root;
+        let (body_root, branch) = body_tree(exec.hash_tree_root().unwrap());
+        let mut i = with_sync(fixture_with_body(0, body_root));
+        i.log = Some(log_input(&t, &exec, branch.clone(), 1, 0));
+        assert_log_rejected(&run(&i), Error::LogMismatch);
+        i.log = Some(log_input(&t, &exec, branch, 0, 0));
+        assert!(run(&i).log_ok);
+    }
+
+    #[test]
+    fn log_predicates_pass_and_fail_and_are_echoed() {
+        use PredicateOp::{Eq, Ne};
+        use PredicateTarget::{DataWord, Topic};
+        let with = |p: Option<PredicateWire>| {
+            let (mut i, _) = log_fixture();
+            i.log.as_mut().unwrap().predicate = p;
+            run(&i)
+        };
+        // data word 0 is [0x10; 32], topic 1 is [0x11; 32]
+        for (target, actual) in [
+            (DataWord(0), topic(0x10)),
+            (Topic(1), topic(0x11)),
+            (Topic(0), topic(0x10)),
+        ] {
+            let p = pred(target, Eq, actual);
+            let o = with(p);
+            assert!(o.log_ok, "{target:?} eq pass: {o:?}");
+            assert_eq!(o.log_predicate, p);
+            assert_log_rejected(&with(pred(target, Eq, topic(0xEE))), Error::PredicateFalse);
+            assert!(
+                with(pred(target, Ne, topic(0xEE))).log_ok,
+                "{target:?} ne pass"
+            );
+            assert_log_rejected(&with(pred(target, Ne, actual)), Error::PredicateFalse);
+        }
+        // a target the log does not have never passes, even for inequality
+        for target in [
+            Topic(3),
+            DataWord(1),
+            PredicateTarget::Balance,
+            PredicateTarget::StorageValue,
+        ] {
+            for op in [Eq, Ne] {
+                assert_log_rejected(&with(pred(target, op, ZERO)), Error::PredicateFalse);
+            }
+        }
+        // the predicate is checked after the log, so a missing log reports the log error
+        let (mut i, _) = log_fixture();
+        let lg = i.log.as_mut().unwrap();
+        lg.address[0] ^= 1;
+        lg.predicate = pred(DataWord(0), Eq, topic(0xEE));
+        assert_log_rejected(&run(&i), Error::LogMismatch);
+    }
+
+    #[test]
+    fn state_predicates_and_statement_ids() {
+        use PredicateOp::{Eq, Ne};
+        let (i, _) = state_fixture();
+        let balance = be32(&trim_be(1_000_000));
+        let value = be32(&[0x12, 0x34]);
+        let with = |p: Option<PredicateWire>| {
+            let mut j = i.clone();
+            j.state.as_mut().unwrap().predicate = p;
+            run(&j)
+        };
+        // IDs: account and storage, over the proven block hash
+        let o = with(None);
+        assert!(o.state_ok, "{o:?}");
+        assert_eq!(
+            o.account_statement_id,
+            statement_id(CHAIN_ID, &[0x57; 32], &ProofKey::Account { address: ADDR })
+        );
+        assert_eq!(
+            o.state_statement_id,
+            statement_id(
+                CHAIN_ID,
+                &[0x57; 32],
+                &ProofKey::Storage {
+                    address: ADDR,
+                    slot: SLOT
+                }
+            )
+        );
+        assert_ne!(o.account_statement_id, o.state_statement_id);
+        assert_eq!(o.state_predicate, None);
+        // another slot, another storage ID, same account ID
+        let (mut j, w) = state_fixture();
+        let s = j.state.as_mut().unwrap();
+        s.slot = SLOT2;
+        s.storage_proof = w.storage.prove(&storage_key(&SLOT2));
+        let o2 = run(&j);
+        assert_eq!(o2.account_statement_id, o.account_statement_id);
+        assert_ne!(o2.state_statement_id, o.state_statement_id);
+        // balance and storage-value predicates
+        let tb = PredicateTarget::Balance;
+        let tv = PredicateTarget::StorageValue;
+        for (t, actual) in [(tb, balance), (tv, value)] {
+            let p = pred(t, Eq, actual);
+            let ok = with(p);
+            assert!(ok.state_ok, "{t:?}: {ok:?}");
+            assert_eq!(ok.state_predicate, p);
+            assert_state_rejected(&with(pred(t, Eq, topic(0xEE))), Error::PredicateFalse);
+            assert!(with(pred(t, Ne, topic(0xEE))).state_ok);
+            assert_state_rejected(&with(pred(t, Ne, actual)), Error::PredicateFalse);
+        }
+        // log targets do not exist in an account or a slot
+        for t in [PredicateTarget::Topic(0), PredicateTarget::DataWord(0)] {
+            for op in [Eq, Ne] {
+                assert_state_rejected(&with(pred(t, op, ZERO)), Error::PredicateFalse);
+            }
+        }
+    }
+
+    #[test]
+    fn state_and_log_sections_run_side_by_side() {
+        // one execution header serves both sections
+        let (_, w) = state_fixture();
+        let t = receipts();
+        let mut exec = exec_for(w.state.root);
+        exec.receipts_root = t.root;
+        let (body_root, branch) = body_tree(exec.hash_tree_root().unwrap());
+        let mut j = with_sync(fixture_with_body(0, body_root));
+        j.state = Some(state_input(&w, &exec, branch.clone()));
+        j.log = Some(log_input(&t, &exec, branch, LOG_TX, 0));
+        let o = run(&j);
+        assert!(o.state_ok && o.log_ok, "{o:?}");
+        assert_eq!(o.exec_block_hash, o.log_block_hash);
+        assert_eq!(o.exec_block_number, o.log_block_number);
+        // one failing section does not affect the other
+        let mut bad = j.clone();
+        bad.log.as_mut().unwrap().address[0] ^= 1;
+        let o = run(&bad);
+        assert!(o.state_ok && !o.log_ok, "{o:?}");
+        let mut bad = j;
+        bad.state.as_mut().unwrap().account_proof.pop();
+        let o = run(&bad);
+        assert!(!o.state_ok && o.log_ok, "{o:?}");
+    }
+
+    #[test]
+    fn log_is_not_evaluated_without_a_trusted_sync_run() {
+        let nothing = |o: &GuestOutput| {
+            assert!(!o.log_checked && !o.log_ok, "{o:?}");
+            assert_eq!(o.log_error_code, 0);
+            assert_eq!((o.log_receipts_root, o.log_statement_id), (ZERO, ZERO));
+        };
+        let (mut i, _) = log_fixture();
+        i.sync = None;
+        nothing(&run(&i));
+        let (mut i, _) = log_fixture();
+        i.trusted_root = [0; 32];
+        nothing(&run(&i));
+        let (mut i, _) = log_fixture();
+        i.sync.as_mut().unwrap().forks = vec![];
+        nothing(&run(&i));
+        // a bad signature leaves no finalized header update, but the store still has the
+        // bootstrap header: the anchor then fails on the branch, not silently
+        let (mut i, _) = log_fixture();
+        i.sync.as_mut().unwrap().updates[0].signature[0] ^= 1;
+        let o = run(&i);
+        assert_eq!(o.sync_validated, 0);
+        assert_log_rejected(&o, Error::InvalidBranch);
+        // and a run with no log section commits an all-default log block
+        nothing(&verify(&with_sync(fixture()), &Mock));
+    }
+
+    #[test]
+    fn predicate_wire_converts_to_the_core_predicate_exactly() {
+        use PredicateTarget as T;
+        for (w, c) in [
+            (T::Balance, Target::Balance),
+            (T::StorageValue, Target::StorageValue),
+            (T::Topic(3), Target::Topic(3)),
+            (T::DataWord(7), Target::DataWord(7)),
+        ] {
+            for (wo, co) in [(PredicateOp::Eq, Op::Eq), (PredicateOp::Ne, Op::Ne)] {
+                let p = PredicateWire {
+                    target: w,
+                    op: wo,
+                    operand: [9; 32],
+                };
+                assert_eq!(
+                    Predicate::from(&p),
+                    Predicate {
+                        target: c,
+                        op: co,
+                        operand: [9; 32]
+                    }
+                );
+            }
+        }
     }
 }

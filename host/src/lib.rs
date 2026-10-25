@@ -1,4 +1,5 @@
-//! Host side of LE-Sync Sprints 1-4 (Sprint 4: `eth_getProof` account/storage proofs): fetch `bootstrap` / `updates` / `finality_update` from a
+//! Host side of LE-Sync Sprints 1-5 (Sprint 4: `eth_getProof` account/storage proofs; Sprint 5:
+//! receipt proofs for logs, predicates, statement IDs): fetch `bootstrap` / `updates` / `finality_update` from a
 //! beacon API (or a saved directory of the same JSON) and verify the SSZ Merkle branches with
 //! `le-sync-core`.
 //!
@@ -22,9 +23,16 @@ use le_sync_core::{
 };
 use le_sync_wire::{
     build_chain_binding, check_chain_binding, ExecWire, FinalityItem, GuestInput, GuestOutput,
-    StateInput, SyncInput, UpdateWire, WireHeader,
+    LogInput, PredicateWire, StateInput, SyncInput, UpdateWire, WireHeader,
 };
 use serde_json::Value;
+
+pub mod receipts;
+use receipts::{
+    check_position, find_log, flip_first_node as flip_first_receipt_node, is_state_target,
+    parse_predicate, parse_tx_sel, quantity, resolve_tx, Filter, LogData, ReceiptData,
+    ReceiptsTrie, TxSel,
+};
 use std::{fs, path::PathBuf};
 
 const FAR_FUTURE_EPOCH: u64 = u64::MAX;
@@ -47,6 +55,11 @@ USAGE:
           [--latest-only]
           [--address 0x.. [--slot 0x..] --execution-rpc <URL|DIR>]
           [--expect-value 0x..] [--expect-balance 0x..] [--tamper-state] [--tamper-exec]
+          [--log-address 0x.. [--log-topic0..3 0x..] [--log-tx N|0x<hash> [--log-index N]]
+           --execution-rpc <URL|DIR>] [--predicate <target><op><operand>]
+          [--expect-id 0x..] [--tamper-receipt]
+          [--prove --receipt-out <file>]
+  le-sync <the same flags as the run> --verify-receipt <file>
 
   --source        beacon API base URL (e.g. https://<host>) or a directory of saved JSON
                   (config_spec.json, bootstrap.json, updates.json, finality_update.json, genesis.json)
@@ -74,12 +87,42 @@ USAGE:
   --expect-balance with --address: the journal's account balance must equal this (hex wei)
   --tamper-state  with --address: flip one bit of the first account-proof node; the guest must
                   reject with the trie-proof error (204) (exit 0 if so)
-  --tamper-exec   with --address: flip one bit of the execution header's state root; the guest
-                  must reject with the branch error (201) (exit 0 if so). Wins over --tamper-state
+  --tamper-exec   with --address and/or --log-address: flip one bit of the execution header's
+                  state root (receipts root for the log); the guest must reject with the branch
+                  error (201) (exit 0 if so). Wins over --tamper-state and --tamper-receipt
+  --log-address   prove an event log emitted by this contract (20 bytes) in the newest finalized
+                  block, under that block's receipts root; implies --sync. Needs --execution-rpc
+                  (eth_getBlockReceipts) or a directory holding block_receipts.json
+  --log-topic0..3 require this topic at that position (0x, up to 32 bytes, left-padded); omitted
+                  positions match anything. topic0 is the event signature hash
+  --log-tx        the transaction: a position in the block (decimal) or its 0x hash. Without it
+                  the host picks the first log in the block that matches address and topics
+  --log-index     which log of that transaction (default 0). Needs --log-tx
+  --predicate     with --address or --log-address: a condition the guest checks over the verified
+                  value, `<target><op><operand>`. Targets: balance, storage (need --address),
+                  topicN, dataN (the N-th 32-byte word of the log data; need --log-address).
+                  Operators: == and !=. A predicate that does not hold makes the guest reject (206).
+                  Example: --predicate 'data0==0x2710'
+  --expect-id     the journal's statement ID must equal this (32 bytes): the log's with
+                  --log-address, otherwise the storage slot's with --address
+  --tamper-receipt with --log-address: flip one bit of the first receipt-proof node; the guest
+                  must reject with the trie-proof error (204) (exit 0 if so)
+
+  --prove         after the guest has executed and every check passed, prove the same run and
+                  verify the receipt against this build's guest image ID. Needs --receipt-out.
+                  Refused for tamper and other-chain runs (the guest rejects those on purpose)
+  --receipt-out   with --prove: write the receipt (journal + seal) to this file
+  --verify-receipt FILE
+                  verify a saved receipt against this build's guest image ID, then judge its
+                  journal with the other flags exactly as a live run would. No guest run, and no
+                  network when --source is a saved directory. Give the flags of the original run
+  RISC0_DEV_MODE  receipts made in dev mode are fake. --prove and --verify-receipt refuse to run
+                  while it is set
 
 EXIT CODES:
   0  OK
-  1  failed (guest error, journal decode, trusted root differs, or checks not satisfied)
+  1  failed (guest error, journal decode, trusted root differs, checks not satisfied, or a
+     receipt whose journal differs from the executed one)
   2  usage error
   3  CHAIN MISMATCH: the journal commits a chain other than the one this host is configured for
 ";
@@ -119,14 +162,48 @@ pub struct StateOpts {
     pub expect_balance: Option<Bytes32>,
     /// Flip a bit in the first account-proof node: the guest must answer `InvalidTrieProof`.
     pub tamper_state: bool,
-    /// Flip a bit in the execution header's `state_root`: the guest must answer `InvalidBranch`.
-    /// Takes precedence over `tamper_state` (the anchor is checked first).
+    /// Flip a bit in the execution header's `state_root` (and, for a log section, its
+    /// `receipts_root`): the guest must answer `InvalidBranch`. Takes precedence over
+    /// `tamper_state` and `tamper_receipt` (the anchor is checked first).
     pub tamper_exec: bool,
+    /// Sprint 5: predicate over the balance or the slot value. Needs `address`.
+    pub predicate: Option<PredicateWire>,
+    /// Sprint 5: required statement ID (the log's if a log is requested, else the slot's).
+    pub expect_id: Option<Bytes32>,
+    /// Sprint 5: log section options.
+    pub log: LogOpts,
+}
+
+/// Sprint 5 options. `address` switches the log section on; the RPC comes from
+/// `StateOpts::execution_rpc`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogOpts {
+    pub address: Option<[u8; 20]>,
+    /// Required topics by position; `None` matches anything.
+    pub topics: [Option<Bytes32>; 4],
+    /// `None` = the host picks the first matching log in the block.
+    pub tx: Option<TxSel>,
+    /// `None` = 0. Only with `tx`.
+    pub log_index: Option<u32>,
+    /// Predicate over a topic or data word of the log. Needs `address`.
+    pub predicate: Option<PredicateWire>,
+    /// Flip a bit in the first receipt-proof node: the guest must answer `InvalidTrieProof`.
+    pub tamper_receipt: bool,
+}
+
+impl LogOpts {
+    pub fn requested(&self) -> bool {
+        self.address.is_some()
+    }
 }
 
 impl StateOpts {
     pub fn requested(&self) -> bool {
         self.address.is_some()
+    }
+    /// Any execution-layer section: the host must pick an anchor from the updates.
+    pub fn needs_anchor(&self) -> bool {
+        self.requested() || self.log.requested()
     }
 }
 
@@ -137,7 +214,7 @@ impl Opts {
             || self.tamper_sig
             || self.other_chain
             || self.cross_config.is_some()
-            || self.state.requested()
+            || self.state.needs_anchor()
     }
 
     /// Runs built to present a different chain than the host's own: the journal's chain binding
@@ -160,6 +237,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
     let (mut sync, mut tamper_sig, mut other_chain, mut latest_only) = (false, false, false, false);
     let mut cross_config: Option<PathBuf> = None;
     let mut st = StateOpts::default();
+    let mut rpc: Option<String> = None;
+    let mut predicate: Option<PredicateWire> = None;
     while let Some(k) = a.next() {
         let mut val = |name: &str| a.next().ok_or_else(|| format!("{name} needs a value"));
         match k.as_str() {
@@ -184,7 +263,40 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
             "--slot" => {
                 st.slot = Some(parse_word(&val("--slot")?).map_err(|e| format!("--slot: {e}"))?)
             }
-            "--execution-rpc" => st.execution_rpc = Some(val("--execution-rpc")?),
+            "--execution-rpc" => rpc = Some(val("--execution-rpc")?),
+            "--log-address" => {
+                st.log.address = Some(
+                    parse_address(&val("--log-address")?)
+                        .map_err(|e| format!("--log-address: {e}"))?,
+                )
+            }
+            k @ ("--log-topic0" | "--log-topic1" | "--log-topic2" | "--log-topic3") => {
+                let pos = (k.as_bytes()[k.len() - 1] - b'0') as usize;
+                st.log.topics[pos] = Some(parse_word(&val(k)?).map_err(|e| format!("{k}: {e}"))?)
+            }
+            "--log-tx" => {
+                st.log.tx =
+                    Some(parse_tx_sel(&val("--log-tx")?).map_err(|e| format!("--log-tx: {e}"))?)
+            }
+            "--log-index" => {
+                st.log.log_index = Some(
+                    val("--log-index")?
+                        .parse()
+                        .map_err(|e| format!("--log-index: {e}"))?,
+                )
+            }
+            "--predicate" => {
+                predicate = Some(
+                    parse_predicate(&val("--predicate")?)
+                        .map_err(|e| format!("--predicate: {e}"))?,
+                )
+            }
+            "--expect-id" => {
+                st.expect_id = Some(
+                    parse_word(&val("--expect-id")?).map_err(|e| format!("--expect-id: {e}"))?,
+                )
+            }
+            "--tamper-receipt" => st.log.tamper_receipt = true,
             "--expect-value" => {
                 st.expect_value = Some(
                     parse_word(&val("--expect-value")?)
@@ -203,21 +315,61 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    // A predicate belongs to the section its target reads.
+    if let Some(p) = predicate {
+        if is_state_target(&p.target) {
+            if st.address.is_none() {
+                return Err("--predicate on balance or storage needs --address".into());
+            }
+            st.predicate = Some(p);
+        } else {
+            if st.log.address.is_none() {
+                return Err("--predicate on a topic or data word needs --log-address".into());
+            }
+            st.log.predicate = Some(p);
+        }
+    }
+    st.execution_rpc = rpc.clone();
     if st.address.is_none() {
         if st.slot.is_some()
-            || st.execution_rpc.is_some()
             || st.expect_value.is_some()
             || st.expect_balance.is_some()
             || st.tamper_state
-            || st.tamper_exec
         {
-            return Err("--slot, --execution-rpc, --expect-value, --expect-balance, --tamper-state and --tamper-exec need --address".into());
+            return Err(
+                "--slot, --expect-value, --expect-balance and --tamper-state need --address".into(),
+            );
         }
-    } else if st.execution_rpc.is_none() {
+        if (rpc.is_some() || st.tamper_exec || st.expect_id.is_some()) && st.log.address.is_none() {
+            return Err(
+                "--execution-rpc, --tamper-exec and --expect-id need --address (or --log-address)"
+                    .into(),
+            );
+        }
+    } else if rpc.is_none() {
         return Err(
             "--address needs --execution-rpc (a JSON-RPC URL or a directory with state_proof.json)"
                 .into(),
         );
+    }
+    if st.log.address.is_none() {
+        if st.log.topics.iter().any(|t| t.is_some())
+            || st.log.tx.is_some()
+            || st.log.log_index.is_some()
+            || st.log.tamper_receipt
+        {
+            return Err(
+                "--log-topic0..3, --log-tx, --log-index and --tamper-receipt need --log-address"
+                    .into(),
+            );
+        }
+    } else {
+        if rpc.is_none() {
+            return Err("--log-address needs --execution-rpc (a JSON-RPC URL or a directory with block_receipts.json)".into());
+        }
+        if st.log.log_index.is_some() && st.log.tx.is_none() {
+            return Err("--log-index needs --log-tx".into());
+        }
     }
     let root_s = root.ok_or("--trusted-root is required")?;
     let raw = hex::decode(root_s.strip_prefix("0x").unwrap_or(&root_s))
@@ -588,6 +740,106 @@ pub fn parse_state_proof(v: &Value) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), Stri
     Ok((account, storage))
 }
 
+/// `eth_getBlockReceipts` response from the JSON-RPC endpoint, or from
+/// `<dir>/block_receipts.json`; saved to `--save-dir` as `block_receipts.json`.
+fn fetch_block_receipts(
+    rpc: &str,
+    save_dir: Option<&PathBuf>,
+    block: u64,
+) -> Result<Value, String> {
+    let bytes: Vec<u8> = if rpc.starts_with("http://") || rpc.starts_with("https://") {
+        let resp = ureq::post(rpc)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_string(&receipts::block_receipts_request(block))
+            .map_err(|e| format!("POST {rpc} eth_getBlockReceipts: {e}"))?;
+        resp.into_string()
+            .map_err(|e| format!("read body of {rpc}: {e}"))?
+            .into_bytes()
+    } else {
+        let p = PathBuf::from(rpc).join("block_receipts.json");
+        fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?
+    };
+    if let Some(dir) = save_dir {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        fs::write(dir.join("block_receipts.json"), &bytes)
+            .map_err(|e| format!("save block_receipts.json: {e}"))?;
+    }
+    let v = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|e| format!("block_receipts.json: bad JSON: {e}"))?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("eth_getBlockReceipts failed: {err}"));
+    }
+    Ok(v)
+}
+
+fn hex_string_bytes(v: &Value, k: &str) -> Result<Vec<u8>, String> {
+    let s = field(v, k)?
+        .as_str()
+        .ok_or_else(|| format!("`{k}`: not a string"))?;
+    parse_hex_bytes(s).map_err(|e| format!("`{k}`: {e}"))
+}
+
+fn quantity_field(v: &Value, k: &str) -> Result<u64, String> {
+    let s = field(v, k)?
+        .as_str()
+        .ok_or_else(|| format!("`{k}`: not a string"))?;
+    quantity(s).map_err(|e| format!("`{k}`: {e}"))
+}
+
+/// Every receipt of the block, in order. A receipt without a post-Byzantium `status` (a
+/// pre-Byzantium `root` instead) is refused: the guest would refuse it too.
+pub fn parse_block_receipts(v: &Value) -> Result<Vec<ReceiptData>, String> {
+    let r = v.get("result").unwrap_or(v);
+    let arr = r.as_array().ok_or(
+        "block receipts: expected a JSON array (the node may not serve eth_getBlockReceipts)",
+    )?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, e) in arr.iter().enumerate() {
+        let at = |m: String| format!("receipt {i}: {m}");
+        // the position in the array is the trie key: a node that reorders them is wrong
+        let idx = quantity_field(e, "transactionIndex").map_err(at)?;
+        if idx != i as u64 {
+            return Err(format!("receipt {i}: transactionIndex is {idx}"));
+        }
+        let bloom: [u8; receipts::BLOOM_LEN] = hex_string_bytes(e, "logsBloom")
+            .map_err(at)?
+            .try_into()
+            .map_err(|_| format!("receipt {i}: logsBloom is not 256 bytes"))?;
+        let ty = quantity_field(e, "type").map_err(at)?;
+        let tx_type =
+            u8::try_from(ty).map_err(|_| format!("receipt {i}: type {ty} is not a byte"))?;
+        let status = quantity_field(e, "status").map_err(at)?;
+        if status > 1 {
+            return Err(format!("receipt {i}: status {status}"));
+        }
+        let mut logs = vec![];
+        for (j, l) in field(e, "logs")?
+            .as_array()
+            .ok_or_else(|| format!("receipt {i}: logs is not an array"))?
+            .iter()
+            .enumerate()
+        {
+            let at = |m: String| format!("receipt {i} log {j}: {m}");
+            let topics = hex_array::<32>(l, "topics").map_err(at)?;
+            logs.push(LogData {
+                address: hex_field::<20>(l, "address").map_err(at)?,
+                topics,
+                data: hex_string_bytes(l, "data").map_err(at)?,
+            });
+        }
+        out.push(ReceiptData {
+            tx_hash: hex_field::<32>(e, "transactionHash").map_err(at)?,
+            tx_type,
+            success: status == 1,
+            cumulative_gas: quantity_field(e, "cumulativeGasUsed").map_err(at)?,
+            bloom,
+            logs,
+        });
+    }
+    Ok(out)
+}
+
 // ---- pure helpers (unit-tested directly; a directory source ignores endpoints) -----------------
 
 /// Sync-committee period of a slot: `slot / (slots_per_epoch * epochs_per_period)`.
@@ -871,7 +1123,7 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
         .or_else(|| top.get("data").and_then(|d| d.as_array()))
         .ok_or("updates: expected a JSON array")?;
     let want_sync = o.wants_sync();
-    let want_state = o.state.requested();
+    let want_state = o.state.needs_anchor();
     let mut anchors: Vec<Anchor> = vec![];
     let mut finality = vec![];
     let mut updates = vec![];
@@ -904,14 +1156,7 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
     let (sync, expected) = if want_sync {
         // The host's own chain: source of the expected binding and of the clock.
         let own = load_chain_facts(&src)?;
-        let expected = build_chain_binding(
-            p.cfg.slots_per_epoch,
-            p.epochs_per_period,
-            own.chain_id,
-            &own.genesis_validators_root,
-            &own.forks,
-        )
-        .map_err(|e| format!("chain binding: {e:?}"))?;
+        let expected = binding_from(&p, &own)?;
         let current_slot = current_slot(&own)?;
         // What the guest is told. Only the chain identity is swapped in a cross-config run;
         // preset timing and fork-epoch config stay the host's own so the Merkle layer is
@@ -949,7 +1194,7 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
     let state = match o.state.address {
         None => None,
         Some(address) => {
-            let anchor = pick_anchor(anchors).ok_or(
+            let anchor = pick_anchor(anchors.clone()).ok_or(
                 "no update with a finalized execution header and >= 2/3 sync participation was \
                  fetched; retry shortly, or run without --latest-only",
             )?;
@@ -983,6 +1228,78 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
                 slot,
                 account_proof,
                 storage_proof,
+                predicate: o.state.predicate,
+            })
+        }
+    };
+
+    let log = match o.state.log.address {
+        None => None,
+        Some(address) => {
+            let anchor = pick_anchor(anchors).ok_or(
+                "no update with a finalized execution header and >= 2/3 sync participation was \
+                 fetched; retry shortly, or run without --latest-only",
+            )?;
+            let rpc = o
+                .state
+                .execution_rpc
+                .as_deref()
+                .ok_or("--log-address needs --execution-rpc")?;
+            let lo = &o.state.log;
+            // The block comes from the (still unverified) header. The rebuilt receipts root must
+            // equal that header's `receipts_root`; the guest then proves the header itself.
+            let receipts = parse_block_receipts(&fetch_block_receipts(
+                rpc,
+                o.save_dir.as_ref(),
+                anchor.exec.block_number,
+            )?)?;
+            let trie = ReceiptsTrie::new(&receipts);
+            if trie.root() != anchor.exec.receipts_root {
+                return Err(format!(
+                    "the receipts of block {} rebuild to root 0x{} but its header says 0x{}: \
+                     the RPC served another block or non-canonical data",
+                    anchor.exec.block_number,
+                    hex::encode(trie.root()),
+                    hex::encode(anchor.exec.receipts_root)
+                ));
+            }
+            let filter = Filter {
+                address,
+                topics: lo.topics,
+            };
+            let (tx, log_index) = match &lo.tx {
+                Some(sel) => {
+                    let tx = resolve_tx(&receipts, sel)?;
+                    let li = lo.log_index.unwrap_or(0);
+                    check_position(&receipts, tx, li, &filter)?;
+                    (tx, li)
+                }
+                None => find_log(&receipts, &filter).ok_or_else(|| {
+                    format!(
+                        "no log in block {} matches the address and topics asked for",
+                        anchor.exec.block_number
+                    )
+                })?,
+            };
+            let mut receipt_proof = trie
+                .proof(tx)
+                .ok_or_else(|| format!("the block has no transaction {tx}"))?;
+            let mut exec = anchor.exec;
+            if o.state.tamper_exec {
+                exec.receipts_root[0] ^= 1;
+            }
+            if lo.tamper_receipt {
+                flip_first_receipt_node(&mut receipt_proof);
+            }
+            Some(LogInput {
+                exec,
+                exec_branch: anchor.branch,
+                tx_index: tx,
+                log_index,
+                receipt_proof,
+                address,
+                topics: lo.topics,
+                predicate: lo.predicate,
             })
         }
     };
@@ -999,8 +1316,106 @@ pub fn collect_checked(o: &Opts) -> Result<Collected, String> {
         finality,
         sync,
         state,
+        log,
     };
     Ok(Collected { input, expected })
+}
+
+/// The binding the host expects the journal to commit, from its own parameters and chain facts.
+fn binding_from(p: &Params, own: &ChainFacts) -> Result<ChainBinding, String> {
+    build_chain_binding(
+        p.cfg.slots_per_epoch,
+        p.epochs_per_period,
+        own.chain_id,
+        &own.genesis_validators_root,
+        &own.forks,
+    )
+    .map_err(|e| format!("chain binding: {e:?}"))
+}
+
+/// The chain binding for `--verify-receipt`: built from `--source` only (a saved directory
+/// works offline), never from the receipt.
+pub fn expected_binding(o: &Opts) -> Result<ChainBinding, String> {
+    let src = Source {
+        base: &o.source,
+        save_dir: None,
+    };
+    let p = load_params(&src)?;
+    let own = load_chain_facts(&src)?;
+    binding_from(&p, &own)
+}
+
+// ==== Proof output ===========================================================================
+
+/// Proof-step options. Parsed apart from `Opts` (`split_proof_args`) so the run options stay as
+/// they are.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProofOpts {
+    /// Prove after a successful execute.
+    pub prove: bool,
+    /// Where `--prove` writes the receipt.
+    pub receipt_out: Option<PathBuf>,
+    /// Verify this saved receipt instead of running the guest.
+    pub verify_receipt: Option<PathBuf>,
+}
+
+/// Take `--prove`, `--receipt-out` and `--verify-receipt` out of the arguments; everything else
+/// is returned, in order, for `parse_args`.
+pub fn split_proof_args<I: IntoIterator<Item = String>>(
+    args: I,
+) -> Result<(ProofOpts, Vec<String>), String> {
+    let mut a = args.into_iter();
+    let mut po = ProofOpts::default();
+    let mut rest = vec![];
+    while let Some(k) = a.next() {
+        match k.as_str() {
+            "--prove" => po.prove = true,
+            "--receipt-out" => {
+                po.receipt_out = Some(PathBuf::from(
+                    a.next().ok_or("--receipt-out needs a value")?,
+                ))
+            }
+            "--verify-receipt" => {
+                po.verify_receipt = Some(PathBuf::from(
+                    a.next().ok_or("--verify-receipt needs a value")?,
+                ))
+            }
+            _ => rest.push(k),
+        }
+    }
+    if po.prove && po.verify_receipt.is_some() {
+        return Err("--prove and --verify-receipt cannot be combined".into());
+    }
+    if po.prove && po.receipt_out.is_none() {
+        return Err("--prove needs --receipt-out <file>".into());
+    }
+    if !po.prove && po.receipt_out.is_some() {
+        return Err("--receipt-out needs --prove".into());
+    }
+    Ok((po, rest))
+}
+
+/// Why a run cannot be proved or verified as a receipt: a tamper or other-chain run is built to
+/// be rejected, so there is nothing to prove.
+pub fn proof_run_error(o: &Opts) -> Option<&'static str> {
+    let negative = o.tamper
+        || o.tamper_sig
+        || o.other_chain
+        || o.cross_config.is_some()
+        || o.state.tamper_state
+        || o.state.tamper_exec
+        || o.state.log.tamper_receipt;
+    negative
+        .then_some("a tamper or other-chain run is rejected on purpose: there is nothing to prove")
+}
+
+/// The receipt must commit exactly the journal the guest executed to.
+pub fn judge_receipt_journal(executed: &[u8], receipt: &[u8]) -> Verdict {
+    if executed == receipt {
+        Verdict::Ok
+    } else {
+        Verdict::ReceiptJournalDiffers
+    }
 }
 
 /// Outcome of judging a journal. `main` maps it to an exit code; kept here so it is testable.
@@ -1017,6 +1432,11 @@ pub enum Verdict {
     /// (rejected, wrong address/slot, wrong expected value/balance, or a tamper run whose
     /// rejection was not the expected typed error).
     StateNotOk,
+    /// Same for the Sprint 5 log section (rejected, wrong log, wrong predicate or statement ID,
+    /// or a tamper run whose rejection was not the expected typed error).
+    LogNotOk,
+    /// The proved receipt's journal is not the journal the guest executed to.
+    ReceiptJournalDiffers,
     NotOk,
 }
 
@@ -1028,6 +1448,8 @@ pub fn verdict_exit_code(v: &Verdict) -> u8 {
         Verdict::ChainMismatchNotDetected
         | Verdict::TrustedRootDiffers
         | Verdict::StateNotOk
+        | Verdict::LogNotOk
+        | Verdict::ReceiptJournalDiffers
         | Verdict::NotOk => 1,
     }
 }
@@ -1047,10 +1469,12 @@ pub fn judge(o: &Opts, out: &GuestOutput, expected: Option<&ChainBinding>) -> Ve
     // tamper-sig / other-chain / cross-config leave Sprint 1 checks untouched: they must pass.
     let sync_ok = !o.wants_sync() || out.sync_success(o.expects_sync_reject());
     if out.success(o.tamper) && sync_ok {
-        if state_ok_for(o, out) {
-            Verdict::Ok
-        } else {
+        if !state_ok_for(o, out) {
             Verdict::StateNotOk
+        } else if !log_ok_for(o, out) {
+            Verdict::LogNotOk
+        } else {
+            Verdict::Ok
         }
     } else {
         Verdict::NotOk
@@ -1080,11 +1504,49 @@ fn state_ok_for(o: &Opts, out: &GuestOutput) -> bool {
         && out.state_slot == st.slot.unwrap_or([0u8; 32])
         && st.expect_value.map_or(true, |v| out.state_value == v)
         && st.expect_balance.map_or(true, |b| out.account_balance == b)
+        && out.state_predicate == st.predicate
+        // `--expect-id` names the log's ID when a log is requested, else the slot's
+        && (st.log.requested() || st.expect_id.map_or(true, |id| out.state_statement_id == id))
+}
+
+/// Sprint 5 judgement, on the journal only. Without `--log-address` there is nothing to judge.
+/// Tamper runs must be rejected by the guest with the specific typed error (the anchor is
+/// checked first, so `--tamper-exec` wins over `--tamper-receipt`).
+fn log_ok_for(o: &Opts, out: &GuestOutput) -> bool {
+    let st = &o.state;
+    let lg = &st.log;
+    let Some(address) = lg.address else {
+        return true;
+    };
+    let rejected_with = |e: Error| out.log_checked && !out.log_ok && out.log_error_code == e.code();
+    if st.tamper_exec {
+        return rejected_with(Error::InvalidBranch);
+    }
+    if lg.tamper_receipt {
+        return rejected_with(Error::InvalidTrieProof);
+    }
+    out.log_checked
+        && out.log_ok
+        && out.log_error_code == 0
+        && out.log_address == address
+        && lg.topics.iter().enumerate().all(|(i, want)| match want {
+            None => true,
+            Some(t) => (out.log_topic_count as usize) > i && out.log_topics[i] == *t,
+        })
+        && match lg.tx {
+            Some(TxSel::Index(n)) => out.log_tx_index == n,
+            // a hash was resolved to a position by the host; the guest proves the position
+            Some(TxSel::Hash(_)) | None => true,
+        }
+        && lg.log_index.map_or(true, |i| out.log_index == i)
+        && out.log_predicate == lg.predicate
+        && st.expect_id.map_or(true, |id| out.log_statement_id == id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use le_sync_wire::PredicateTarget;
     use sha2::{Digest, Sha256};
 
     fn h2(a: &Bytes32, b: &Bytes32) -> Bytes32 {
@@ -2264,6 +2726,137 @@ mod tests {
         assert!(USAGE.contains("3  CHAIN MISMATCH"));
     }
 
+    // ==== Proof output ===========================================================================
+
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    const ROOT_HEX: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn run_opts(extra: &[&str]) -> Opts {
+        let mut a = vec!["--source", "x", "--trusted-root", ROOT_HEX];
+        a.extend_from_slice(extra);
+        parse_args(sv(&a)).unwrap()
+    }
+
+    #[test]
+    fn proof_split_takes_its_flags_and_keeps_the_rest_in_order() {
+        let (po, rest) = split_proof_args(sv(&[
+            "--source",
+            "x",
+            "--prove",
+            "--address",
+            "0xaa",
+            "--receipt-out",
+            "r.bin",
+            "--sync",
+        ]))
+        .unwrap();
+        assert!(po.prove);
+        assert_eq!(po.receipt_out, Some(PathBuf::from("r.bin")));
+        assert_eq!(po.verify_receipt, None);
+        assert_eq!(rest, sv(&["--source", "x", "--address", "0xaa", "--sync"]));
+
+        let (po, rest) =
+            split_proof_args(sv(&["--verify-receipt", "r.bin", "--source", "d"])).unwrap();
+        assert!(!po.prove);
+        assert_eq!(po.verify_receipt, Some(PathBuf::from("r.bin")));
+        assert_eq!(rest, sv(&["--source", "d"]));
+
+        let (po, rest) = split_proof_args(sv(&["--source", "x"])).unwrap();
+        assert_eq!(po, ProofOpts::default());
+        assert_eq!(rest, sv(&["--source", "x"]));
+        let (po, rest) = split_proof_args(Vec::<String>::new()).unwrap();
+        assert_eq!(po, ProofOpts::default());
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn proof_split_rules() {
+        let e = |v: &[&str]| split_proof_args(sv(v)).unwrap_err();
+        assert_eq!(e(&["--prove"]), "--prove needs --receipt-out <file>");
+        assert_eq!(
+            e(&["--receipt-out", "r.bin"]),
+            "--receipt-out needs --prove"
+        );
+        assert_eq!(
+            e(&["--prove", "--receipt-out", "a", "--verify-receipt", "b"]),
+            "--prove and --verify-receipt cannot be combined"
+        );
+        assert_eq!(
+            e(&["--prove", "--receipt-out"]),
+            "--receipt-out needs a value"
+        );
+        assert_eq!(e(&["--verify-receipt"]), "--verify-receipt needs a value");
+        // verify alone and prove with an output are fine
+        assert!(split_proof_args(sv(&["--verify-receipt", "b"])).is_ok());
+        assert!(split_proof_args(sv(&["--prove", "--receipt-out", "a"])).is_ok());
+    }
+
+    #[test]
+    fn proof_is_refused_for_every_negative_run_and_allowed_otherwise() {
+        let addr = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+        let neg: Vec<Vec<&str>> = vec![
+            vec!["--tamper"],
+            vec!["--sync", "--tamper-sig"],
+            vec!["--sync", "--other-chain"],
+            vec!["--cross-config", "d"],
+            vec!["--address", addr, "--execution-rpc", "r", "--tamper-state"],
+            vec!["--address", addr, "--execution-rpc", "r", "--tamper-exec"],
+            vec![
+                "--log-address",
+                addr,
+                "--execution-rpc",
+                "r",
+                "--tamper-receipt",
+            ],
+        ];
+        for n in neg {
+            assert!(proof_run_error(&run_opts(&n)).is_some(), "{n:?}");
+        }
+        assert_eq!(proof_run_error(&run_opts(&[])), None);
+        assert_eq!(proof_run_error(&run_opts(&["--sync"])), None);
+        assert_eq!(
+            proof_run_error(&run_opts(&["--address", addr, "--execution-rpc", "r"])),
+            None
+        );
+        assert_eq!(
+            proof_run_error(&run_opts(&["--log-address", addr, "--execution-rpc", "r"])),
+            None
+        );
+    }
+
+    #[test]
+    fn proof_receipt_journal_must_equal_the_executed_one() {
+        assert_eq!(judge_receipt_journal(b"abc", b"abc"), Verdict::Ok);
+        assert_eq!(judge_receipt_journal(b"", b""), Verdict::Ok);
+        assert_eq!(
+            judge_receipt_journal(b"abc", b"abd"),
+            Verdict::ReceiptJournalDiffers
+        );
+        assert_eq!(
+            judge_receipt_journal(b"abc", b"ab"),
+            Verdict::ReceiptJournalDiffers
+        );
+        assert_eq!(
+            judge_receipt_journal(b"ab", b"abc"),
+            Verdict::ReceiptJournalDiffers
+        );
+        assert_eq!(verdict_exit_code(&Verdict::ReceiptJournalDiffers), 1);
+    }
+
+    #[test]
+    fn proof_flags_are_in_the_usage() {
+        for f in [
+            "--prove",
+            "--receipt-out",
+            "--verify-receipt",
+            "RISC0_DEV_MODE",
+        ] {
+            assert!(USAGE.contains(f), "{f}");
+        }
+    }
+
     // ==== Sprint 4: account + storage state proof ================================================
 
     fn word(n: u8) -> Bytes32 {
@@ -2806,5 +3399,459 @@ mod tests {
         );
 
         assert_eq!(verdict_exit_code(&Verdict::StateNotOk), 1);
+    }
+    // ---- Sprint 5: log section flags and judgement ---------------------------------------------
+
+    fn log_args(extra: &[&str]) -> Vec<String> {
+        let mut v = vec!["--source", "/d", "--trusted-root", ROOT];
+        v.extend_from_slice(extra);
+        args(&v)
+    }
+    const CONTRACT: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+
+    #[test]
+    fn log_flags_parse_into_the_log_options() {
+        let o = parse_args(log_args(&[
+            "--log-address",
+            CONTRACT,
+            "--log-topic0",
+            "0x01",
+            "--log-topic2",
+            "0x02",
+            "--log-tx",
+            "129",
+            "--log-index",
+            "2",
+            "--execution-rpc",
+            "/rpc",
+            "--expect-id",
+            "0x07",
+            "--tamper-receipt",
+        ]))
+        .unwrap();
+        let lg = &o.state.log;
+        assert_eq!(lg.address, Some([0xc0; 20]));
+        assert_eq!(lg.topics, [Some(word(1)), None, Some(word(2)), None]);
+        assert_eq!(lg.tx, Some(TxSel::Index(129)));
+        assert_eq!(lg.log_index, Some(2));
+        assert!(lg.tamper_receipt && lg.predicate.is_none());
+        assert_eq!(o.state.execution_rpc.as_deref(), Some("/rpc"));
+        assert_eq!(o.state.expect_id, Some(word(7)));
+        // a log run needs the sync section but not an account
+        assert!(o.state.log.requested() && !o.state.requested());
+        assert!(o.state.needs_anchor() && o.wants_sync());
+        // a transaction by hash, topics 1 and 3
+        let h = format!("0x{}", "ab".repeat(32));
+        let o = parse_args(log_args(&[
+            "--log-address",
+            CONTRACT,
+            "--execution-rpc",
+            "/r",
+            "--log-tx",
+            &h,
+            "--log-topic1",
+            "0x09",
+            "--log-topic3",
+            "0x0a",
+        ]))
+        .unwrap();
+        assert_eq!(o.state.log.tx, Some(TxSel::Hash([0xab; 32])));
+        assert_eq!(
+            o.state.log.topics,
+            [None, Some(word(9)), None, Some(word(10))]
+        );
+        // no log flags: nothing requested
+        let o = parse_args(log_args(&[])).unwrap();
+        assert_eq!(o.state.log, LogOpts::default());
+        assert!(!o.state.needs_anchor());
+    }
+
+    #[test]
+    fn a_predicate_goes_to_the_section_its_target_reads() {
+        let addr = "11".repeat(20);
+        let both = [
+            "--address",
+            &addr,
+            "--log-address",
+            CONTRACT,
+            "--execution-rpc",
+            "/r",
+        ];
+        let with = |p: &str| {
+            let mut v = both.to_vec();
+            v.extend(["--predicate", p]);
+            parse_args(log_args(&v)).unwrap()
+        };
+        let o = with("balance==0x05");
+        assert_eq!(
+            o.state.predicate.map(|p| p.target),
+            Some(PredicateTarget::Balance)
+        );
+        assert!(o.state.log.predicate.is_none());
+        let o = with("storage!=0x00");
+        assert_eq!(
+            o.state.predicate.map(|p| p.target),
+            Some(PredicateTarget::StorageValue)
+        );
+        let o = with("data0==0x2710");
+        assert_eq!(
+            o.state.log.predicate.map(|p| p.target),
+            Some(PredicateTarget::DataWord(0))
+        );
+        assert!(o.state.predicate.is_none());
+        let o = with("topic2!=0x01");
+        assert_eq!(
+            o.state.log.predicate.map(|p| p.target),
+            Some(PredicateTarget::Topic(2))
+        );
+    }
+
+    #[test]
+    fn log_flag_errors_say_what_is_missing() {
+        let err = |extra: &[&str]| parse_args(log_args(extra)).unwrap_err();
+        // log-only flags without --log-address
+        for lone in [
+            vec!["--log-topic0", "0x1"],
+            vec!["--log-tx", "1"],
+            vec!["--log-index", "1"],
+            vec!["--tamper-receipt"],
+        ] {
+            assert!(err(&lone).contains("--log-address"), "{lone:?}");
+        }
+        // --log-address needs an RPC, --log-index needs --log-tx
+        assert!(err(&["--log-address", CONTRACT]).contains("--execution-rpc"));
+        assert!(err(&[
+            "--log-address",
+            CONTRACT,
+            "--execution-rpc",
+            "/r",
+            "--log-index",
+            "1"
+        ])
+        .contains("--log-tx"));
+        // the shared flags still say --address (or --log-address)
+        for lone in [
+            vec!["--execution-rpc", "/r"],
+            vec!["--tamper-exec"],
+            vec!["--expect-id", "0x1"],
+        ] {
+            assert!(err(&lone).contains("--address"), "{lone:?}");
+        }
+        // predicate on the wrong section
+        let addr = "11".repeat(20);
+        assert!(err(&["--predicate", "balance==0x1"]).contains("--address"));
+        assert!(err(&["--predicate", "data0==0x1"]).contains("--log-address"));
+        assert!(err(&[
+            "--address",
+            &addr,
+            "--execution-rpc",
+            "/r",
+            "--predicate",
+            "topic0==0x1"
+        ])
+        .contains("--log-address"));
+        // malformed values
+        assert!(err(&["--log-address", "0x12"]).contains("--log-address"));
+        assert!(err(&[
+            "--log-address",
+            CONTRACT,
+            "--log-topic0",
+            &format!("0x{}", "11".repeat(33))
+        ])
+        .contains("--log-topic0"));
+        assert!(err(&["--log-address", CONTRACT, "--log-tx", "abc"]).contains("--log-tx"));
+        assert!(err(&["--log-address", CONTRACT, "--log-index", "-1"]).contains("--log-index"));
+        assert!(err(&["--predicate", "nonsense"]).contains("--predicate"));
+        assert!(err(&["--expect-id", "zz"]).contains("--expect-id"));
+    }
+
+    fn log_journal(root: Bytes32, own: &ChainBinding) -> GuestOutput {
+        GuestOutput {
+            log_checked: true,
+            log_ok: true,
+            log_address: [0xc0; 20],
+            log_tx_index: 129,
+            log_index: 2,
+            log_topic_count: 3,
+            log_topics: [word(1), word(8), word(2), [0; 32]],
+            log_statement_id: word(7),
+            ..journal(root, own, 1, 0)
+        }
+    }
+    fn log_opts(root: Bytes32, lg: LogOpts, st: StateOpts) -> Opts {
+        judge_opts(
+            root,
+            StateOpts {
+                execution_rpc: Some("x".into()),
+                log: lg,
+                ..st
+            },
+        )
+    }
+    fn base_log() -> LogOpts {
+        LogOpts {
+            address: Some([0xc0; 20]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_log_run_is_judged_on_what_the_journal_commits() {
+        let root = [0xab; 32];
+        let own = bind(1, 0xAA);
+        let j = log_journal(root, &own);
+        let ok = |lg: LogOpts, st: StateOpts, j: &GuestOutput| {
+            judge(&log_opts(root, lg, st), j, Some(&own))
+        };
+        assert_eq!(ok(base_log(), StateOpts::default(), &j), Verdict::Ok);
+        // topic constraints are compared with the committed topics, by position
+        let t = |topics| LogOpts {
+            topics,
+            ..base_log()
+        };
+        assert_eq!(
+            ok(
+                t([Some(word(1)), None, Some(word(2)), None]),
+                StateOpts::default(),
+                &j
+            ),
+            Verdict::Ok
+        );
+        assert_eq!(
+            ok(
+                t([Some(word(9)), None, None, None]),
+                StateOpts::default(),
+                &j
+            ),
+            Verdict::LogNotOk
+        );
+        // a constraint on a position the log does not have
+        assert_eq!(
+            ok(
+                t([None, None, None, Some([0; 32])]),
+                StateOpts::default(),
+                &j
+            ),
+            Verdict::LogNotOk
+        );
+        // address, position, log index
+        let mut bad = j.clone();
+        bad.log_address[0] ^= 1;
+        assert_eq!(
+            ok(base_log(), StateOpts::default(), &bad),
+            Verdict::LogNotOk
+        );
+        let pos = |tx, li| LogOpts {
+            tx: Some(tx),
+            log_index: li,
+            ..base_log()
+        };
+        assert_eq!(
+            ok(pos(TxSel::Index(129), Some(2)), StateOpts::default(), &j),
+            Verdict::Ok
+        );
+        assert_eq!(
+            ok(pos(TxSel::Index(130), None), StateOpts::default(), &j),
+            Verdict::LogNotOk
+        );
+        assert_eq!(
+            ok(pos(TxSel::Index(129), Some(1)), StateOpts::default(), &j),
+            Verdict::LogNotOk
+        );
+        // a hash is resolved by the host; any position is accepted for it
+        assert_eq!(
+            ok(pos(TxSel::Hash([1; 32]), None), StateOpts::default(), &j),
+            Verdict::Ok
+        );
+        // the predicate that held must be the one asked for
+        let p = parse_predicate("data0==0x2710").unwrap();
+        let asked = LogOpts {
+            predicate: Some(p),
+            ..base_log()
+        };
+        assert_eq!(
+            ok(asked.clone(), StateOpts::default(), &j),
+            Verdict::LogNotOk
+        );
+        let held = GuestOutput {
+            log_predicate: Some(p),
+            ..j.clone()
+        };
+        assert_eq!(ok(asked, StateOpts::default(), &held), Verdict::Ok);
+        let other = parse_predicate("data0==0x2711").unwrap();
+        let wrong = GuestOutput {
+            log_predicate: Some(other),
+            ..j.clone()
+        };
+        assert_eq!(
+            ok(
+                LogOpts {
+                    predicate: Some(p),
+                    ..base_log()
+                },
+                StateOpts::default(),
+                &wrong
+            ),
+            Verdict::LogNotOk
+        );
+        // a journal predicate nobody asked for is not accepted either
+        assert_eq!(
+            ok(base_log(), StateOpts::default(), &held),
+            Verdict::LogNotOk
+        );
+        // the statement ID
+        let id = |n| StateOpts {
+            expect_id: Some(word(n)),
+            ..Default::default()
+        };
+        assert_eq!(ok(base_log(), id(7), &j), Verdict::Ok);
+        assert_eq!(ok(base_log(), id(8), &j), Verdict::LogNotOk);
+        // rejected or never evaluated
+        let rejected = GuestOutput {
+            log_ok: false,
+            log_error_code: Error::LogMismatch.code(),
+            ..j.clone()
+        };
+        assert_eq!(
+            ok(base_log(), StateOpts::default(), &rejected),
+            Verdict::LogNotOk
+        );
+        assert_eq!(
+            ok(base_log(), StateOpts::default(), &journal(root, &own, 1, 0)),
+            Verdict::LogNotOk
+        );
+        assert_eq!(verdict_exit_code(&Verdict::LogNotOk), 1);
+    }
+
+    #[test]
+    fn log_tamper_runs_pass_only_on_their_own_code() {
+        let root = [0xab; 32];
+        let own = bind(1, 0xAA);
+        let rejected = |code: u16| GuestOutput {
+            log_checked: true,
+            log_error_code: code,
+            ..journal(root, &own, 1, 0)
+        };
+        let j = |lg: LogOpts, st: StateOpts, o: &GuestOutput| {
+            judge(&log_opts(root, lg, st), o, Some(&own))
+        };
+        let receipt = LogOpts {
+            tamper_receipt: true,
+            ..base_log()
+        };
+        assert_eq!(
+            j(
+                receipt.clone(),
+                StateOpts::default(),
+                &rejected(Error::InvalidTrieProof.code())
+            ),
+            Verdict::Ok
+        );
+        assert_eq!(
+            j(
+                receipt.clone(),
+                StateOpts::default(),
+                &rejected(Error::InvalidBranch.code())
+            ),
+            Verdict::LogNotOk
+        );
+        assert_eq!(
+            j(
+                receipt.clone(),
+                StateOpts::default(),
+                &rejected(Error::LogMismatch.code())
+            ),
+            Verdict::LogNotOk
+        );
+        assert_eq!(
+            j(receipt.clone(), StateOpts::default(), &rejected(0)),
+            Verdict::LogNotOk
+        );
+        // the guest accepting a tampered proof is the failure we test for
+        assert_eq!(
+            j(
+                receipt.clone(),
+                StateOpts::default(),
+                &log_journal(root, &own)
+            ),
+            Verdict::LogNotOk
+        );
+        // --tamper-exec wins: the anchor is checked first
+        let exec = StateOpts {
+            tamper_exec: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            j(
+                base_log(),
+                exec.clone(),
+                &rejected(Error::InvalidBranch.code())
+            ),
+            Verdict::Ok
+        );
+        assert_eq!(
+            j(
+                base_log(),
+                exec.clone(),
+                &rejected(Error::InvalidTrieProof.code())
+            ),
+            Verdict::LogNotOk
+        );
+        assert_eq!(
+            j(receipt, exec, &rejected(Error::InvalidBranch.code())),
+            Verdict::Ok
+        );
+    }
+
+    #[test]
+    fn state_predicate_and_id_are_judged_too() {
+        let root = [0xab; 32];
+        let own = bind(1, 0xAA);
+        let addr = [0x11u8; 20];
+        let p = parse_predicate("balance==0x06").unwrap();
+        let st = StateOpts {
+            address: Some(addr),
+            execution_rpc: Some("x".into()),
+            predicate: Some(p),
+            ..Default::default()
+        };
+        let o = judge_opts(root, st.clone());
+        let held = GuestOutput {
+            state_predicate: Some(p),
+            state_statement_id: word(3),
+            ..state_journal(root, &own, addr)
+        };
+        assert_eq!(judge(&o, &held, Some(&own)), Verdict::Ok);
+        // the predicate did not hold (or was not echoed)
+        assert_eq!(
+            judge(&o, &state_journal(root, &own, addr), Some(&own)),
+            Verdict::StateNotOk
+        );
+        // without a predicate asked for, an echoed one is refused
+        let none = judge_opts(
+            root,
+            StateOpts {
+                predicate: None,
+                ..st.clone()
+            },
+        );
+        assert_eq!(judge(&none, &held, Some(&own)), Verdict::StateNotOk);
+        // --expect-id names the slot's statement when no log is requested
+        let id = |n| {
+            judge_opts(
+                root,
+                StateOpts {
+                    predicate: None,
+                    expect_id: Some(word(n)),
+                    ..st.clone()
+                },
+            )
+        };
+        let plain = GuestOutput {
+            state_predicate: None,
+            ..held.clone()
+        };
+        assert_eq!(judge(&id(3), &plain, Some(&own)), Verdict::Ok);
+        assert_eq!(judge(&id(4), &plain, Some(&own)), Verdict::StateNotOk);
     }
 }

@@ -1,7 +1,9 @@
 //! `le-sync-core`: `no_std`, allocation-free Ethereum light-client primitives.
 //!
-//! Scope (Sprint 4): execution-layer state proofs: `ExecutionPayloadHeader` root (`exec`),
-//! strict RLP (`rlp`), Merkle-Patricia proofs (`mpt`), account + storage lookups (`state`).
+//! Scope (Sprints 4 and 5): execution-layer proofs: `ExecutionPayloadHeader` root (`exec`),
+//! strict RLP (`rlp`), Merkle-Patricia proofs (`mpt`), account, storage and log lookups
+//! (`state`), receipt and log decoding (`receipt`), predicates (`predicate`) and statement
+//! IDs (`statement`).
 //!
 //! Spec map (all from `ethereum/consensus-specs`):
 //! * `phase0/beacon-chain.md`            `is_valid_merkle_branch`
@@ -26,8 +28,11 @@ extern crate self as le_sync_core;
 pub mod exec;
 pub mod keccak;
 pub mod mpt;
+pub mod predicate;
+pub mod receipt;
 pub mod rlp;
 pub mod state;
+pub mod statement;
 pub mod sync;
 
 pub type Bytes32 = [u8; 32];
@@ -66,6 +71,13 @@ pub enum Error {
     /// A Merkle-Patricia proof does not verify under the given root: hash mismatch, missing or
     /// surplus nodes, bad hex-prefix path, or malformed node structure (Sprint 4).
     InvalidTrieProof,
+    /// A verified receipt does not yield the requested log (Sprint 5): the transaction failed,
+    /// there is no receipt at the index, the log index is out of range, or the log's address
+    /// or topics differ from the filter.
+    LogMismatch,
+    /// The predicate does not hold over the verified value, or its target is absent from it
+    /// (Sprint 5, provisional until RFP-021 Func #4 is confirmed).
+    PredicateFalse,
     CommitteeSizeMismatch,
     InsufficientParticipants,
     BadSlotOrder,
@@ -96,7 +108,7 @@ pub type ErrorCode = u16;
 impl Error {
     /// Every variant, for coverage tests. Keep in sync with the enum; `code()` and
     /// `message()` are exhaustive matches, so a new variant fails to compile until it has both.
-    pub const ALL: [Error; 20] = [
+    pub const ALL: [Error; 22] = [
         Error::BadConfig,
         Error::UnsupportedFork,
         Error::BadSyncCommitteeSize,
@@ -105,6 +117,8 @@ impl Error {
         Error::GenesisFinalizedHeaderNotEmpty,
         Error::InvalidRlp,
         Error::InvalidTrieProof,
+        Error::LogMismatch,
+        Error::PredicateFalse,
         Error::CommitteeSizeMismatch,
         Error::InsufficientParticipants,
         Error::BadSlotOrder,
@@ -131,6 +145,8 @@ impl Error {
             Error::GenesisFinalizedHeaderNotEmpty => 202,
             Error::InvalidRlp => 203,
             Error::InvalidTrieProof => 204,
+            Error::LogMismatch => 205,
+            Error::PredicateFalse => 206,
             Error::CommitteeSizeMismatch => 300,
             Error::InsufficientParticipants => 301,
             Error::BadSlotOrder => 302,
@@ -157,6 +173,8 @@ impl Error {
             Error::GenesisFinalizedHeaderNotEmpty => "finalized header at the genesis slot must be the empty header",
             Error::InvalidRlp => "RLP data is malformed or not canonically encoded, or a decoded account/storage value has the wrong shape; the proof payload is corrupt or forged",
             Error::InvalidTrieProof => "Merkle-Patricia proof does not verify under the given root (hash mismatch, missing or surplus node, or malformed path); the account/storage proof is corrupt, forged, or for another state",
+            Error::LogMismatch => "the receipt does not yield the requested log (failed transaction, no receipt at that index, log index out of range, or address/topics differ from the request); check the transaction index, log index and filter",
+            Error::PredicateFalse => "the predicate does not hold over the verified value, or its target is not present in it; the statement is not emitted",
             Error::CommitteeSizeMismatch => "participation bitfield or next committee size does not match the current sync committee",
             Error::InsufficientParticipants => "update has no sync committee participants",
             Error::BadSlotOrder => "slots must satisfy current >= signature > attested >= finalized",
@@ -882,7 +900,7 @@ mod tests {
     #[test]
     fn error_code_numbering_is_pinned() {
         // Changing any of these is a breaking change to the public error contract.
-        let pinned: [(Error, ErrorCode); 20] = [
+        let pinned: [(Error, ErrorCode); 22] = [
             (Error::BadConfig, 100),
             (Error::UnsupportedFork, 101),
             (Error::BadSyncCommitteeSize, 102),
@@ -891,6 +909,8 @@ mod tests {
             (Error::GenesisFinalizedHeaderNotEmpty, 202),
             (Error::InvalidRlp, 203),
             (Error::InvalidTrieProof, 204),
+            (Error::LogMismatch, 205),
+            (Error::PredicateFalse, 206),
             (Error::CommitteeSizeMismatch, 300),
             (Error::InsufficientParticipants, 301),
             (Error::BadSlotOrder, 302),
