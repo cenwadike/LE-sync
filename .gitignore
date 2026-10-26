@@ -24,5 +24,9 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-fixtures/
+.scaffold/
+lez/target/
+receipts/
+fixture/
+fixture-log/
 consensus-spec-tests/

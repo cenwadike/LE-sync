@@ -1,0 +1,9 @@
+target/
+Cargo.lock.bak
+.env.local
+.scaffold
+
+.claude/
+.cursor/
+idl/
+AGENTS.md
