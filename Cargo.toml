@@ -1,6 +1,6 @@
 [workspace]
 members = ["core", "wire", "host", "vectors", "testkit"]
-exclude = ["guest"]
+exclude = ["guest", "guest-stage", "bench"]
 resolver = "2"
 
 [workspace.package]

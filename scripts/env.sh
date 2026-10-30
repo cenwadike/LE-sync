@@ -28,12 +28,19 @@
 #   le_verify_receipt <file> [state|log] [flags]
 #                   verify a saved receipt against this build's guest image ID and judge its
 #                   journal, offline from the fixture of that kind. Give the flags of the run
+#   le_cost [flags] execute-only cycles of the three staged update steps (Begin, Miller, Finish)
+#                   from bench/, against a mainnet-size committee. No network and no proving.
+#                   Flags go to the bench: --committee N, --scenario NAME, --cap CYCLES, --detail
 #   le              raw host CLI (any flags)
 # After le_verify these shell variables hold the results:
 #   BLOCK  G_BALANCE G_VALUE (from the guest)  I_BALANCE I_VALUE (from the RPC)
 # After le_log:
 #   L_BLOCK L_TX L_LOGINDEX L_ADDR L_TOPICS L_DATALEN L_DATAHASH L_ID (from the guest)
 #   I_LOG (from the RPC: status address data-length topics...)
+# After le_cost:
+#   COST_SCENARIO  COST_BEGIN COST_MILLER COST_FINISH (executor cycles of each step, from the bench)
+# Sourcing this file needs the network (trusted root, RPC checks). If it is offline, run the bench
+# directly: cargo run --manifest-path bench/Cargo.toml --release -- [flags]
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   echo "source this file: source scripts/env.sh" >&2
@@ -317,6 +324,33 @@ le_log_replay() {
 
 le_log_all() { le_log && le_log_tamper && le_log_predicate && le_log_replay; }
 
+# ---- cost gate (Sprint 6, M1) -----------------------------------------------------------------
+
+# Execute-only cycles of the three staged update steps, from bench/. Prints the bench's table, then
+# reads its last machine line:
+#   cost: scenario=<name> begin=<n> miller=<n> finish=<n>
+# and sets COST_SCENARIO, COST_BEGIN, COST_MILLER, COST_FINISH. Fails if the bench exits non-zero
+# (a guest result that differs from the native run, a rejected step, a step over --cap) or prints
+# no such line. Extra flags go to the bench, e.g. le_cost --committee 512 --cap 10000000 --detail
+le_cost() {
+  unset COST_SCENARIO COST_BEGIN COST_MILLER COST_FINISH
+  _le_runcmd cargo run --manifest-path bench/Cargo.toml --release -- "$@"
+  if [ "$LE_RC" != "0" ]; then echo "cost: FAIL (bench exit $LE_RC)"; return 1; fi
+  local line
+  line=$(grep '^cost: ' "$LE_LOG" | tail -1)
+  COST_SCENARIO=$(printf '%s' "$line" | sed -n 's/^cost: scenario=\([^ ]*\) .*/\1/p')
+  COST_BEGIN=$(printf '%s' "$line" | sed -n 's/.* begin=\([0-9]*\).*/\1/p')
+  COST_MILLER=$(printf '%s' "$line" | sed -n 's/.* miller=\([0-9]*\).*/\1/p')
+  COST_FINISH=$(printf '%s' "$line" | sed -n 's/.* finish=\([0-9]*\).*/\1/p')
+  if [ -z "$COST_SCENARIO" ] || [ -z "$COST_BEGIN" ] || [ -z "$COST_MILLER" ] || [ -z "$COST_FINISH" ]; then
+    unset COST_SCENARIO COST_BEGIN COST_MILLER COST_FINISH
+    echo "cost: FAIL (no cost line in the bench output)"; return 1
+  fi
+  export COST_SCENARIO COST_BEGIN COST_MILLER COST_FINISH
+  echo
+  echo "cost: PASS $COST_SCENARIO begin=$COST_BEGIN miller=$COST_MILLER finish=$COST_FINISH"
+}
+
 # ---- proof output -----------------------------------------------------------------------------
 
 # Verify a saved receipt offline and judge its journal like a live run.
@@ -382,4 +416,4 @@ echo "env: ADDR=$ADDR SLOT=$SLOT"
 echo "env: LOGADDR=$LOGADDR"
 le_check || return 1
 le_check_receipts || echo "env: warning: le_log will not work with this RPC (set X to a node with eth_getBlockReceipts)" >&2
-echo "env: ready. commands: le_verify  le_tamper  le_all  le_replay  le_log  le_log_tamper  le_log_predicate  le_log_replay  le_log_all  le_prove  le_verify_receipt  le"
+echo "env: ready. commands: le_verify  le_tamper  le_all  le_replay  le_log  le_log_tamper  le_log_predicate  le_log_replay  le_log_all  le_prove  le_verify_receipt  le_cost  le"

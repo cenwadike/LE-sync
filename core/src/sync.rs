@@ -515,13 +515,23 @@ pub fn initialize_light_client_store(
     })
 }
 
-pub fn validate_light_client_update<B: Bls>(
-    store: &LightClientStore,
+/// What the BLS check needs, produced by `check_light_client_update` once every other
+/// validity rule has passed: the committee that must have signed and the signing root.
+#[derive(Clone, Copy, Debug)]
+pub struct SignatureInputs<'a> {
+    pub committee: &'a SyncCommittee,
+    pub signing_root: Bytes32,
+}
+
+/// Every `validate_light_client_update` rule except the signature, in the spec order. On
+/// success it returns what the signature check needs. It is deterministic and does no BLS
+/// work, so the staged path can repeat it at each step.
+pub fn check_light_client_update<'s>(
+    store: &'s LightClientStore,
     update: &LightClientUpdate,
     current_slot: u64,
     cfg: &SyncConfig,
-    bls: &B,
-) -> Result<(), Error> {
+) -> Result<SignatureInputs<'s>, Error> {
     cfg.check()?;
 
     let n = update.sync_committee_bits.len() * 8;
@@ -614,16 +624,40 @@ pub fn validate_light_client_update<B: Bls>(
         &cfg.genesis_validators_root,
     );
     let signing_root = compute_signing_root(&update.attested_header.hash_tree_root(), &domain);
+    Ok(SignatureInputs {
+        committee,
+        signing_root,
+    })
+}
+
+/// The BLS verdict of `validate_light_client_update`: `BadSignature` unless the committee's
+/// participating members signed `inputs.signing_root`.
+pub fn verify_update_signature<B: Bls>(
+    bls: &B,
+    update: &LightClientUpdate,
+    inputs: &SignatureInputs,
+) -> Result<(), Error> {
     if !bls.fast_aggregate_verify(
-        committee.keys(),
-        &committee.aggregate_pubkey,
+        inputs.committee.keys(),
+        &inputs.committee.aggregate_pubkey,
         update.sync_committee_bits,
-        &signing_root,
+        &inputs.signing_root,
         &update.sync_committee_signature,
     ) {
         return Err(Error::BadSignature);
     }
     Ok(())
+}
+
+pub fn validate_light_client_update<B: Bls>(
+    store: &LightClientStore,
+    update: &LightClientUpdate,
+    current_slot: u64,
+    cfg: &SyncConfig,
+    bls: &B,
+) -> Result<(), Error> {
+    let inputs = check_light_client_update(store, update, current_slot, cfg)?;
+    verify_update_signature(bls, update, &inputs)
 }
 
 pub fn apply_light_client_update(
@@ -664,7 +698,18 @@ pub fn process_light_client_update<B: Bls>(
     bls: &B,
 ) -> Result<(), Error> {
     validate_light_client_update(store, update, current_slot, cfg, bls)?;
+    accept_validated_update(store, update, cfg)
+}
 
+/// The tail of `process_light_client_update`: apply an update that has already passed
+/// `validate_light_client_update` (or its staged equivalent) against this exact store.
+/// Calling it on an unvalidated update bypasses every check; it is `pub` only so the staged
+/// path (`update_job`) can reach it.
+pub fn accept_validated_update(
+    store: &mut LightClientStore,
+    update: &LightClientUpdate,
+    cfg: &SyncConfig,
+) -> Result<(), Error> {
     let active = count_bits(update.sync_committee_bits);
 
     // Track the best valid update (spec ranking) for a later force-update.
@@ -702,18 +747,18 @@ pub fn process_light_client_update<B: Bls>(
 // -------------------------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    const SPE: u64 = 8;
-    const EPP: u64 = 8; // period = 64 slots (minimal preset)
-    const N: usize = 32; // minimal SYNC_COMMITTEE_SIZE
-    const FORK_V: Version = [0x05, 0, 0, 1];
-    const GVR_A: Bytes32 = [0xAA; 32];
-    const GVR_B: Bytes32 = [0xBB; 32];
+    pub(crate) const SPE: u64 = 8;
+    pub(crate) const EPP: u64 = 8; // period = 64 slots (minimal preset)
+    pub(crate) const N: usize = 32; // minimal SYNC_COMMITTEE_SIZE
+    pub(crate) const FORK_V: Version = [0x05, 0, 0, 1];
+    pub(crate) const GVR_A: Bytes32 = [0xAA; 32];
+    pub(crate) const GVR_B: Bytes32 = [0xBB; 32];
 
-    fn cfg(gvr: Bytes32) -> SyncConfig {
+    pub(crate) fn cfg(gvr: Bytes32) -> SyncConfig {
         SyncConfig {
             chain: ChainConfig {
                 slots_per_epoch: SPE,
@@ -727,7 +772,7 @@ mod tests {
     }
 
     // ---- tree helpers (same oracle style as lib tests) ----
-    fn leaf_n(i: u64) -> Bytes32 {
+    pub(crate) fn leaf_n(i: u64) -> Bytes32 {
         let mut h = Sha256::new();
         h.update(b"sync-test");
         h.update(i.to_le_bytes());
@@ -754,7 +799,7 @@ mod tests {
         }
         out
     }
-    fn committee(seed: u64) -> SyncCommittee {
+    pub(crate) fn committee(seed: u64) -> SyncCommittee {
         let keys: Vec<BlsPubkey> = (0..N as u64)
             .map(|i| {
                 let mut k = [0u8; 48];
@@ -851,7 +896,7 @@ mod tests {
         }
     }
 
-    fn bits(set: usize) -> Vec<u8> {
+    pub(crate) fn bits(set: usize) -> Vec<u8> {
         let mut b = vec![0u8; N / 8];
         for i in 0..set {
             b[i / 8] |= 1 << (i % 8);
@@ -861,16 +906,16 @@ mod tests {
 
     /// Store at finalized slot 8 (period 0) + an Electra update that finalizes slot 24 and
     /// carries committee B; attested slot 40, signature slot 41.
-    struct Fx {
-        store: LightClientStore,
-        next: SyncCommittee,
-        fin_hdr: BeaconBlockHeader,
-        att: BeaconBlockHeader,
-        finality_branch: Vec<Bytes32>,
-        next_branch: Vec<Bytes32>,
-        bits: Vec<u8>,
+    pub(crate) struct Fx {
+        pub(crate) store: LightClientStore,
+        pub(crate) next: SyncCommittee,
+        pub(crate) fin_hdr: BeaconBlockHeader,
+        pub(crate) att: BeaconBlockHeader,
+        pub(crate) finality_branch: Vec<Bytes32>,
+        pub(crate) next_branch: Vec<Bytes32>,
+        pub(crate) bits: Vec<u8>,
     }
-    fn fixture() -> Fx {
+    pub(crate) fn fixture() -> Fx {
         let (a, b) = (committee(1), committee(2));
         // bootstrap
         let boot_state = state(leaf_n(1), &a, &committee(9));
@@ -897,7 +942,7 @@ mod tests {
             bits: bits(N),
         }
     }
-    fn upd<'a>(f: &'a Fx, sig_slot: u64) -> LightClientUpdate<'a> {
+    pub(crate) fn upd<'a>(f: &'a Fx, sig_slot: u64) -> LightClientUpdate<'a> {
         LightClientUpdate {
             attested_header: f.att,
             next_sync_committee: &f.next,

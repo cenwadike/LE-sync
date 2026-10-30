@@ -6,6 +6,7 @@
 //!
 //! serde note: `[u8; 48]` has no serde impl, so pubkeys travel as one flat `Vec<u8>`.
 pub mod bls;
+pub mod stage;
 
 use le_sync_core::exec::{anchor_execution, verify_execution_anchor, ExecutionPayloadHeader};
 use le_sync_core::keccak::keccak256;
@@ -909,17 +910,17 @@ fn verify_inner<B: Bls>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use le_sync_core::{hash_pair, sync::Version, sync_committee_root, ZERO};
 
-    const N: usize = 32;
-    const GVR: Bytes32 = [0xAA; 32];
-    const FV: Version = [5, 0, 0, 1];
-    const CHAIN_ID: u64 = 1;
+    pub(crate) const N: usize = 32;
+    pub(crate) const GVR: Bytes32 = [0xAA; 32];
+    pub(crate) const FV: Version = [5, 0, 0, 1];
+    pub(crate) const CHAIN_ID: u64 = 1;
 
     /// Accepts iff the signature starts with 7 and the signing root is the one for `GVR`/`FV`.
-    struct Mock;
+    pub(crate) struct Mock;
     impl Bls for Mock {
         fn fast_aggregate_verify(
             &self,
@@ -967,7 +968,7 @@ mod tests {
             body_root: leaf(2),
         }
     }
-    fn fixture() -> GuestInput {
+    pub(crate) fn fixture() -> GuestInput {
         fixture_seeded(0)
     }
     /// `seed` changes the committee keys (and so the bootstrap state root and trusted root);
@@ -1030,7 +1031,7 @@ mod tests {
     }
 
     /// Adds one finality-only update (no next committee) at slots 40/41 signed (per Mock) by sig[0]==7.
-    fn with_sync(mut i: GuestInput) -> GuestInput {
+    pub(crate) fn with_sync(mut i: GuestInput) -> GuestInput {
         let f = i.finality[0].clone();
         i.sync = Some(SyncInput {
             chain_id: CHAIN_ID,

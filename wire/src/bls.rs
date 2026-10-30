@@ -3,8 +3,11 @@
 //! Extra features (both off by default):
 //! * `cycle-trace`: the guest logs a per-phase cycle breakdown of every aggregate verify
 //!   (needs `risc0-zkvm`, so guest builds only).
-//! * `unchecked-pubkeys`: only affects `bls-blst`. The `bls-zk` path never subgroup-checks
-//!   committee keys (see SECURITY JUDGEMENT below).
+//! * `unchecked-pubkeys`: no effect any more. Neither backend subgroup-checks committee keys
+//!   (see SECURITY JUDGEMENT below); kept so existing manifests still resolve.
+//!
+//! `bls-blst` also implements `le_sync_core::update_job::StagedBls`: the same check in three
+//! stages (prepare, Miller loop, final exponentiation) for the three-transaction update.
 //!
 //! SECURITY JUDGEMENT (bls-zk): the committee pubkeys and `aggregate_pubkey` are authenticated
 //! by a Merkle branch to the trusted state root, and were proof-of-possession-checked at
@@ -43,8 +46,7 @@ fn cc() -> u64 {
     }
 }
 
-/// Option B (risc0-patched `blst`) lives in its own file so it can be excluded from mutation
-/// testing as a unit (it is not the audited path and panics in the guest today).
+/// Option B (risc0-patched `blst`, staged) lives in its own file, `bls/blst_impl.rs`.
 #[cfg(feature = "bls-blst")]
 mod blst_impl;
 

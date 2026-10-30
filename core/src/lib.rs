@@ -33,7 +33,9 @@ pub mod receipt;
 pub mod rlp;
 pub mod state;
 pub mod statement;
+pub mod store_codec;
 pub mod sync;
+pub mod update_job;
 
 pub type Bytes32 = [u8; 32];
 pub type BlsPubkey = [u8; 48];
@@ -99,6 +101,18 @@ pub enum Error {
     /// the verifier expected differs from the one the proof commits to. Consumer-side check;
     /// the guest itself cannot detect a mislabelled `chain_id`.
     ChainMismatch,
+    /// A staged update step was called out of order (`update_job`): the saved job is not at
+    /// the step this call expects. Nothing was changed.
+    WrongStep,
+    /// The saved job does not belong to the update presented now (or the job bytes are
+    /// malformed). Nothing was changed.
+    JobMismatch,
+    /// The light-client store is not the one the staged job was begun against (another
+    /// update was applied in between). Nothing was changed; begin again.
+    StoreChanged,
+    /// Store bytes are not a canonical `store_codec` v1 encoding, or the store cannot be
+    /// encoded (invalid committee length).
+    StoreEncoding,
 }
 
 /// Stable numeric error code. Numbers are part of the public contract (dry-run and on-chain
@@ -108,7 +122,7 @@ pub type ErrorCode = u16;
 impl Error {
     /// Every variant, for coverage tests. Keep in sync with the enum; `code()` and
     /// `message()` are exhaustive matches, so a new variant fails to compile until it has both.
-    pub const ALL: [Error; 22] = [
+    pub const ALL: [Error; 26] = [
         Error::BadConfig,
         Error::UnsupportedFork,
         Error::BadSyncCommitteeSize,
@@ -131,6 +145,10 @@ impl Error {
         Error::CheckpointStale,
         Error::BelowThreshold,
         Error::ChainMismatch,
+        Error::WrongStep,
+        Error::JobMismatch,
+        Error::StoreChanged,
+        Error::StoreEncoding,
     ];
 
     /// Stable code. Ranges: 1xx config, 2xx bootstrap/branches, 3xx update validity,
@@ -155,6 +173,10 @@ impl Error {
             Error::FinalizedHeaderNotEmpty => 305,
             Error::NextCommitteeNotEmpty => 306,
             Error::NextCommitteeMismatch => 307,
+            Error::WrongStep => 308,
+            Error::JobMismatch => 309,
+            Error::StoreChanged => 310,
+            Error::StoreEncoding => 311,
             Error::BadSignature => 400,
             Error::CheckpointStale => 500,
             Error::BelowThreshold => 501,
@@ -187,6 +209,10 @@ impl Error {
             Error::CheckpointStale => "finalized checkpoint is older than the weak-subjectivity guideline; obtain a fresher trusted checkpoint",
             Error::BelowThreshold => "sync committee participation is below 2/3; update rejected without verifying the signature",
             Error::ChainMismatch => "proof commits to a different chain than expected (chain ID, genesis_validators_root, fork schedule or preset timing); verify against the correct chain",
+            Error::WrongStep => "staged update step called out of order; the saved job is not at the step this call expects (begin, then miller, then finish)",
+            Error::JobMismatch => "the saved update job does not match the update presented (or the job bytes are malformed); finish the job with the update it was begun with, or begin again",
+            Error::StoreChanged => "the light-client store changed since this update job was begun; begin the update again against the current store",
+            Error::StoreEncoding => "store bytes are not a canonical v1 encoding, or the store cannot be encoded; the stored state is corrupt or from another version",
         }
     }
 }
@@ -900,7 +926,7 @@ mod tests {
     #[test]
     fn error_code_numbering_is_pinned() {
         // Changing any of these is a breaking change to the public error contract.
-        let pinned: [(Error, ErrorCode); 22] = [
+        let pinned: [(Error, ErrorCode); 26] = [
             (Error::BadConfig, 100),
             (Error::UnsupportedFork, 101),
             (Error::BadSyncCommitteeSize, 102),
@@ -919,6 +945,10 @@ mod tests {
             (Error::FinalizedHeaderNotEmpty, 305),
             (Error::NextCommitteeNotEmpty, 306),
             (Error::NextCommitteeMismatch, 307),
+            (Error::WrongStep, 308),
+            (Error::JobMismatch, 309),
+            (Error::StoreChanged, 310),
+            (Error::StoreEncoding, 311),
             (Error::BadSignature, 400),
             (Error::CheckpointStale, 500),
             (Error::BelowThreshold, 501),

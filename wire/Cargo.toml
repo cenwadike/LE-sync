@@ -50,3 +50,11 @@ le-sync-testkit = { path = "../testkit" }
 name = "negative"
 path = "tests/negative.rs"
 required-features = ["bls-zk"]
+
+# Differential suite for the staged update: the staged blst backend against the single-shot
+# bls-zk path. Needs both backends:
+#   cargo test -p le-sync-wire --features bls-zk,bls-blst --test staged_update
+[[test]]
+name = "staged_update"
+path = "tests/staged_update.rs"
+required-features = ["bls-zk", "bls-blst"]

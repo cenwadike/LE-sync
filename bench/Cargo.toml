@@ -1,0 +1,32 @@
+[package]
+name = "le-sync-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Sprint 6 M1 cost gate: executes the three staged update steps in the RISC Zero executor (execute-only) and prints a cycles table"
+
+# Own workspace, like ../guest and ../guest-stage. It is listed in the root `exclude`.
+# Reason: `bls-blst` pulls in the risc0 fork of `blst` (`links = "blst"`), and
+# `le-sync-vectors` pulls in crates.io `blst` by default; one workspace build that enables
+# both fails. Build and run this crate through `--manifest-path bench/Cargo.toml`.
+[workspace]
+
+[dependencies]
+le-sync-core = { path = "../core" }
+# `bls-blst` gives the native reference run `Impl: StagedBls`. Default features keep serde on.
+le-sync-wire = { path = "../wire", features = ["bls-blst"] }
+# Seeded committees, real BLS signer and BeaconState-shaped trees for the synthetic fixture.
+le-sync-testkit = { path = "../testkit" }
+# Same pin as ../host.
+risc0-zkvm = "=3.0.5"
+# The host side of ../guest-stage/src/lez_io.rs (included by path) derives serde.
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+risc0-build = "=3.0.5"
+
+# risc0-build compiles ../guest-stage (package name `guest-stage`), which has three binaries:
+# guest-stage, lez-stage and keys. The generated constants are expected to be GUEST_STAGE_*,
+# LEZ_STAGE_* and KEYS_* (each ELF and ID); confirm in the generated methods.rs.
+[package.metadata.risc0]
+methods = ["../guest-stage"]
