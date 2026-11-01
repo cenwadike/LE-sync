@@ -6,6 +6,7 @@
 //!
 //! serde note: `[u8; 48]` has no serde impl, so pubkeys travel as one flat `Vec<u8>`.
 pub mod bls;
+pub mod rooted;
 pub mod stage;
 
 use le_sync_core::exec::{anchor_execution, verify_execution_anchor, ExecutionPayloadHeader};

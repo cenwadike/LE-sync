@@ -210,11 +210,20 @@ pub trait Bls {
     ) -> bool;
 }
 
+/// A sync committee. Either FULL (all `len` keys in `pubkeys`) or ROOTED: only the root of the
+/// key tree and the aggregate key are known and `pubkeys` is all zero. A rooted committee is
+/// what a staged store keeps (`store_codec` v2): the keys an update needs are supplied with it
+/// and proven against the root (`multiproof`, `update_job::begin_update_rooted`).
+///
+/// `keys_root` is private so that "rooted" always means "`pubkeys` is zero"; use `rooted`.
+/// `keys()` of a rooted committee is a slice of zeros, so the paths that aggregate keys
+/// (`verify_update_signature`, `update_job::begin_update`) refuse a rooted committee.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncCommittee {
     pub pubkeys: [BlsPubkey; MAX_SYNC_COMMITTEE_SIZE],
     pub len: usize,
     pub aggregate_pubkey: BlsPubkey,
+    keys_root: Option<Bytes32>,
 }
 
 impl SyncCommittee {
@@ -223,7 +232,46 @@ impl SyncCommittee {
             pubkeys: [[0u8; 48]; MAX_SYNC_COMMITTEE_SIZE],
             len: len.min(MAX_SYNC_COMMITTEE_SIZE),
             aggregate_pubkey: [0u8; 48],
+            keys_root: None,
         }
+    }
+
+    /// A rooted committee of `len` keys: `BadSyncCommitteeSize` unless `len` is a power of two
+    /// within `MAX_SYNC_COMMITTEE_SIZE`. `keys_root` is `hash_tree_root(Vector[BLSPubkey, len])`.
+    pub fn rooted(
+        len: usize,
+        keys_root: Bytes32,
+        aggregate_pubkey: BlsPubkey,
+    ) -> Result<Self, Error> {
+        if len == 0 || !len.is_power_of_two() || len > MAX_SYNC_COMMITTEE_SIZE {
+            return Err(Error::BadSyncCommitteeSize);
+        }
+        let mut c = Self::empty(len);
+        c.aggregate_pubkey = aggregate_pubkey;
+        c.keys_root = Some(keys_root);
+        Ok(c)
+    }
+
+    pub fn is_rooted(&self) -> bool {
+        self.keys_root.is_some()
+    }
+
+    /// The root of the key tree of a rooted committee; `None` for a full one.
+    pub fn stored_keys_root(&self) -> Option<Bytes32> {
+        self.keys_root
+    }
+
+    /// The root of the key tree: the stored one if rooted, else computed from the keys.
+    pub fn keys_root(&self) -> Result<Bytes32, Error> {
+        match self.keys_root {
+            Some(r) => Ok(r),
+            None => pubkeys_root(self.keys()),
+        }
+    }
+
+    /// The rooted form of this committee (itself, if it is already rooted).
+    pub fn to_rooted(&self) -> Result<Self, Error> {
+        Self::rooted(self.len, self.keys_root()?, self.aggregate_pubkey)
     }
 
     pub fn new(keys: &[BlsPubkey], aggregate_pubkey: BlsPubkey) -> Result<Self, Error> {
@@ -241,11 +289,20 @@ impl SyncCommittee {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.aggregate_pubkey == [0u8; 48] && self.keys().iter().all(|k| *k == [0u8; 48])
+        match self.keys_root {
+            Some(r) => self.aggregate_pubkey == [0u8; 48] && r == [0u8; 32],
+            None => {
+                self.aggregate_pubkey == [0u8; 48] && self.keys().iter().all(|k| *k == [0u8; 48])
+            }
+        }
     }
 
+    /// `hash_tree_root(SyncCommittee)`: the leaf a next-committee branch proves.
     pub fn root(&self) -> Result<Bytes32, Error> {
-        sync_committee_root(self.keys(), &self.aggregate_pubkey)
+        Ok(committee_root_from(
+            &self.keys_root()?,
+            &self.aggregate_pubkey,
+        ))
     }
 }
 
@@ -342,6 +399,20 @@ pub struct LightClientStore {
 }
 
 impl LightClientStore {
+    /// The same store with both committees rooted. An unknown next committee stays unknown.
+    pub fn to_rooted(&self) -> Result<Self, Error> {
+        let next = if self.next_sync_committee.is_empty() {
+            self.next_sync_committee.clone()
+        } else {
+            self.next_sync_committee.to_rooted()?
+        };
+        Ok(Self {
+            current_sync_committee: self.current_sync_committee.to_rooted()?,
+            next_sync_committee: next,
+            ..self.clone()
+        })
+    }
+
     pub fn is_next_sync_committee_known(&self) -> bool {
         !self.next_sync_committee.is_empty()
     }
@@ -637,6 +708,10 @@ pub fn verify_update_signature<B: Bls>(
     update: &LightClientUpdate,
     inputs: &SignatureInputs,
 ) -> Result<(), Error> {
+    // a rooted committee has no keys to aggregate: use the staged rooted path
+    if inputs.committee.is_rooted() {
+        return Err(Error::AbsentKeys);
+    }
     if !bls.fast_aggregate_verify(
         inputs.committee.keys(),
         &inputs.committee.aggregate_pubkey,
@@ -1963,5 +2038,131 @@ pub(crate) mod tests {
         y.attested_header = hdr(41, f.att.state_root, 3);
         assert!(is_better_update(&x, &y, &c));
         assert!(!is_better_update(&y, &x, &c));
+    }
+
+    // ---- rooted committees (the staged store keeps a root, not the keys) ----
+
+    #[test]
+    fn a_rooted_committee_has_the_same_hash_tree_root_as_the_full_one() {
+        let full = committee(1);
+        let r = full.to_rooted().unwrap();
+        assert!(!full.is_rooted());
+        assert!(r.is_rooted());
+        assert_eq!(full.stored_keys_root(), None);
+        assert_eq!(r.stored_keys_root(), Some(full.keys_root().unwrap()));
+        assert_eq!(
+            full.keys_root().unwrap(),
+            pubkeys_root(full.keys()).unwrap()
+        );
+        assert_eq!((r.len, r.aggregate_pubkey), (N, full.aggregate_pubkey));
+        assert!(r.keys().iter().all(|k| *k == [0u8; 48]), "no keys are kept");
+        assert_eq!(r.root().unwrap(), full.root().unwrap());
+        assert_eq!(r.to_rooted().unwrap(), r, "rooting a rooted committee");
+        assert_ne!(r, full, "a rooted and a full committee are not equal");
+        // another key tree or another aggregate is another committee
+        let other = committee(2).to_rooted().unwrap();
+        assert_ne!(r, other);
+        assert_ne!(r.root().unwrap(), other.root().unwrap());
+        let mut moved = r.clone();
+        moved.aggregate_pubkey[0] ^= 1;
+        assert_ne!(r.root().unwrap(), moved.root().unwrap());
+    }
+
+    #[test]
+    fn rooted_needs_a_valid_size() {
+        for len in [0usize, 3, 24, 33, 100, 1024] {
+            assert_eq!(
+                SyncCommittee::rooted(len, [1; 32], [2; 48]).err(),
+                Some(Error::BadSyncCommitteeSize),
+                "len {len}"
+            );
+        }
+        for len in [1usize, 2, 32, 512] {
+            let c = SyncCommittee::rooted(len, [1; 32], [2; 48]).unwrap();
+            assert_eq!(c.len, len);
+            assert_eq!(c.stored_keys_root(), Some([1; 32]));
+            assert_eq!(c.aggregate_pubkey, [2; 48]);
+        }
+    }
+
+    #[test]
+    fn rooted_emptiness_needs_a_zero_root_and_a_zero_aggregate() {
+        assert!(SyncCommittee::rooted(N, [0; 32], [0; 48])
+            .unwrap()
+            .is_empty());
+        assert!(!SyncCommittee::rooted(N, [1; 32], [0; 48])
+            .unwrap()
+            .is_empty());
+        assert!(!SyncCommittee::rooted(N, [0; 32], [1; 48])
+            .unwrap()
+            .is_empty());
+        assert!(!committee(1).to_rooted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rooting_a_store_keeps_an_unknown_next_committee_unknown() {
+        let f = fixture();
+        let r = f.store.to_rooted().unwrap();
+        assert!(r.current_sync_committee.is_rooted());
+        assert!(!r.next_sync_committee.is_rooted());
+        assert!(!r.is_next_sync_committee_known());
+        assert_eq!(
+            r.current_sync_committee.root(),
+            f.store.current_sync_committee.root()
+        );
+
+        let mut known = f.store.clone();
+        known.next_sync_committee = f.next.clone();
+        known.previous_max_active_participants = 11;
+        known.current_max_active_participants = 12;
+        let k = known.to_rooted().unwrap();
+        assert!(k.next_sync_committee.is_rooted());
+        assert!(k.is_next_sync_committee_known());
+        assert_eq!(k.next_sync_committee.root(), f.next.root());
+        assert_eq!(k.finalized_header, known.finalized_header);
+        assert_eq!(k.optimistic_header, known.optimistic_header);
+        assert_eq!(k.previous_max_active_participants, 11);
+        assert_eq!(k.current_max_active_participants, 12);
+    }
+
+    #[test]
+    fn the_non_bls_rules_do_not_care_how_the_committee_is_kept() {
+        let f = fixture();
+        let rooted_store = f.store.to_rooted().unwrap();
+        let next_rooted = f.next.to_rooted().unwrap();
+        let mut u = upd(&f, 41);
+        u.next_sync_committee = &next_rooted;
+        let full = check_light_client_update(&f.store, &upd(&f, 41), 41, &cfg(GVR_A)).unwrap();
+        let rooted = check_light_client_update(&rooted_store, &u, 41, &cfg(GVR_A)).unwrap();
+        assert_eq!(full.signing_root, rooted.signing_root);
+        assert_eq!(full.committee.root(), rooted.committee.root());
+        assert!(rooted.committee.is_rooted());
+        // a rooted next committee that is not the one the branch proves
+        let wrong = committee(3).to_rooted().unwrap();
+        u.next_sync_committee = &wrong;
+        assert_eq!(
+            check_light_client_update(&rooted_store, &u, 41, &cfg(GVR_A)).err(),
+            Some(Error::InvalidBranch)
+        );
+    }
+
+    #[test]
+    fn the_single_shot_check_refuses_a_rooted_committee() {
+        let f = fixture();
+        let u = upd(&f, 41);
+        let m = Mock::ok();
+        let full = check_light_client_update(&f.store, &u, 41, &cfg(GVR_A)).unwrap();
+        assert_eq!(verify_update_signature(&m, &u, &full), Ok(()));
+        assert_eq!(m.seen.borrow().len(), 1);
+        let rooted_store = f.store.to_rooted().unwrap();
+        let next_rooted = f.next.to_rooted().unwrap();
+        let mut ur = upd(&f, 41);
+        ur.next_sync_committee = &next_rooted;
+        let rooted = check_light_client_update(&rooted_store, &ur, 41, &cfg(GVR_A)).unwrap();
+        assert_eq!(
+            verify_update_signature(&m, &ur, &rooted),
+            Err(Error::AbsentKeys)
+        );
+        assert_eq!(m.seen.borrow().len(), 1, "no key was handed to the backend");
     }
 }

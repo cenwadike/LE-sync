@@ -28,6 +28,7 @@ extern crate self as le_sync_core;
 pub mod exec;
 pub mod keccak;
 pub mod mpt;
+pub mod multiproof;
 pub mod predicate;
 pub mod receipt;
 pub mod rlp;
@@ -113,6 +114,10 @@ pub enum Error {
     /// Store bytes are not a canonical `store_codec` v1 encoding, or the store cannot be
     /// encoded (invalid committee length).
     StoreEncoding,
+    /// The keys a rooted staged update supplies for the absent committee members are not
+    /// acceptable: not the members the participation bits leave out, not points on the curve,
+    /// or not proven against the committee's keys root (`multiproof`). Nothing was changed.
+    AbsentKeys,
 }
 
 /// Stable numeric error code. Numbers are part of the public contract (dry-run and on-chain
@@ -122,7 +127,7 @@ pub type ErrorCode = u16;
 impl Error {
     /// Every variant, for coverage tests. Keep in sync with the enum; `code()` and
     /// `message()` are exhaustive matches, so a new variant fails to compile until it has both.
-    pub const ALL: [Error; 26] = [
+    pub const ALL: [Error; 27] = [
         Error::BadConfig,
         Error::UnsupportedFork,
         Error::BadSyncCommitteeSize,
@@ -149,6 +154,7 @@ impl Error {
         Error::JobMismatch,
         Error::StoreChanged,
         Error::StoreEncoding,
+        Error::AbsentKeys,
     ];
 
     /// Stable code. Ranges: 1xx config, 2xx bootstrap/branches, 3xx update validity,
@@ -177,6 +183,7 @@ impl Error {
             Error::JobMismatch => 309,
             Error::StoreChanged => 310,
             Error::StoreEncoding => 311,
+            Error::AbsentKeys => 312,
             Error::BadSignature => 400,
             Error::CheckpointStale => 500,
             Error::BelowThreshold => 501,
@@ -212,7 +219,8 @@ impl Error {
             Error::WrongStep => "staged update step called out of order; the saved job is not at the step this call expects (begin, then miller, then finish)",
             Error::JobMismatch => "the saved update job does not match the update presented (or the job bytes are malformed); finish the job with the update it was begun with, or begin again",
             Error::StoreChanged => "the light-client store changed since this update job was begun; begin the update again against the current store",
-            Error::StoreEncoding => "store bytes are not a canonical v1 encoding, or the store cannot be encoded; the stored state is corrupt or from another version",
+            Error::StoreEncoding => "store bytes are not a canonical v1 or v2 encoding, or the store cannot be encoded; the stored state is corrupt or from another version",
+            Error::AbsentKeys => "the keys supplied for the absent committee members are not the members the participation bits leave out, are not valid points, or do not match the committee's keys root; rebuild the key hints and proof from the committee",
         }
     }
 }
@@ -331,7 +339,7 @@ impl BeaconBlockHeader {
 }
 
 /// `hash_tree_root(BLSPubkey)`: ByteVector[48] -> two chunks (second zero-padded) -> hash.
-fn pubkey_root(pk: &BlsPubkey) -> Bytes32 {
+pub fn pubkey_root(pk: &BlsPubkey) -> Bytes32 {
     let mut a = ZERO;
     let mut b = ZERO;
     a.copy_from_slice(&pk[..32]);
@@ -339,11 +347,10 @@ fn pubkey_root(pk: &BlsPubkey) -> Bytes32 {
     hash_pair(&a, &b)
 }
 
-/// `hash_tree_root(SyncCommittee{pubkeys: Vector[BLSPubkey, N], aggregate_pubkey})`.
-pub fn sync_committee_root(
-    pubkeys: &[BlsPubkey],
-    aggregate_pubkey: &BlsPubkey,
-) -> Result<Bytes32, Error> {
+/// `hash_tree_root(Vector[BLSPubkey, N])`: the root of the committee's key tree, the value a
+/// rooted committee stores in place of its keys. `BadSyncCommitteeSize` unless `N` is a power
+/// of two within `MAX_SYNC_COMMITTEE_SIZE`.
+pub fn pubkeys_root(pubkeys: &[BlsPubkey]) -> Result<Bytes32, Error> {
     let n = pubkeys.len();
     if n == 0 || !n.is_power_of_two() || n > MAX_SYNC_COMMITTEE_SIZE {
         return Err(Error::BadSyncCommitteeSize);
@@ -360,7 +367,23 @@ pub fn sync_committee_root(
         }
         len /= 2;
     }
-    Ok(hash_pair(&buf[0], &pubkey_root(aggregate_pubkey)))
+    Ok(buf[0])
+}
+
+/// `hash_tree_root(SyncCommittee)` from the root of its key tree and its aggregate key.
+pub fn committee_root_from(keys_root: &Bytes32, aggregate_pubkey: &BlsPubkey) -> Bytes32 {
+    hash_pair(keys_root, &pubkey_root(aggregate_pubkey))
+}
+
+/// `hash_tree_root(SyncCommittee{pubkeys: Vector[BLSPubkey, N], aggregate_pubkey})`.
+pub fn sync_committee_root(
+    pubkeys: &[BlsPubkey],
+    aggregate_pubkey: &BlsPubkey,
+) -> Result<Bytes32, Error> {
+    Ok(committee_root_from(
+        &pubkeys_root(pubkeys)?,
+        aggregate_pubkey,
+    ))
 }
 
 /// Light-client generalized indices in force at a slot.
@@ -704,6 +727,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keys_root_and_committee_root_compose() {
+        let (pks, agg) = committee(512);
+        let roots: Vec<Bytes32> = pks.iter().map(pubkey_root).collect();
+        let kr = pubkeys_root(&pks).unwrap();
+        assert_eq!(kr, merkleize_recursive(&roots));
+        assert_eq!(
+            committee_root_from(&kr, &agg),
+            sync_committee_root(&pks, &agg).unwrap()
+        );
+        // the aggregate and the keys root both matter, in this order
+        assert_ne!(
+            committee_root_from(&kr, &agg),
+            committee_root_from(&kr, &pk(1))
+        );
+        assert_ne!(
+            committee_root_from(&kr, &agg),
+            committee_root_from(&roots[0], &agg)
+        );
+        assert_eq!(pubkeys_root(&pks[..100]), Err(Error::BadSyncCommitteeSize));
+        assert_eq!(pubkeys_root(&[]), Err(Error::BadSyncCommitteeSize));
+    }
+
+    #[test]
+    fn a_leaf_is_the_key_then_sixteen_zero_bytes_hashed() {
+        // `hash_tree_root(BLSPubkey)`: the multiproof leaves are exactly these
+        let k = pk(3);
+        let mut padded = [0u8; 64];
+        padded[..48].copy_from_slice(&k);
+        let mut h = Sha256::new();
+        h.update(padded);
+        let want: Bytes32 = h.finalize().into();
+        assert_eq!(pubkey_root(&k), want);
+    }
+
     // ---- fork selection ---------------------------------------------------------------------
 
     const CFG: ChainConfig = ChainConfig {
@@ -926,7 +984,7 @@ mod tests {
     #[test]
     fn error_code_numbering_is_pinned() {
         // Changing any of these is a breaking change to the public error contract.
-        let pinned: [(Error, ErrorCode); 26] = [
+        let pinned: [(Error, ErrorCode); 27] = [
             (Error::BadConfig, 100),
             (Error::UnsupportedFork, 101),
             (Error::BadSyncCommitteeSize, 102),
@@ -949,6 +1007,7 @@ mod tests {
             (Error::JobMismatch, 309),
             (Error::StoreChanged, 310),
             (Error::StoreEncoding, 311),
+            (Error::AbsentKeys, 312),
             (Error::BadSignature, 400),
             (Error::CheckpointStale, 500),
             (Error::BelowThreshold, 501),

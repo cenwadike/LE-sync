@@ -49,6 +49,9 @@ fn cc() -> u64 {
 /// Option B (risc0-patched `blst`, staged) lives in its own file, `bls/blst_impl.rs`.
 #[cfg(feature = "bls-blst")]
 mod blst_impl;
+/// Host helper for the rooted update hints (`rooted::absent_wire`).
+#[cfg(feature = "bls-blst")]
+pub use blst_impl::uncompress_g1;
 
 /// On-curve decompression only. Subgroup membership comes from the authenticated committee.
 #[cfg(feature = "bls-zk")]

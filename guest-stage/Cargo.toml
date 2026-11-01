@@ -8,17 +8,27 @@ edition = "2021"
 [workspace]
 
 # Three programs in one guest package (risc0-build embeds every binary of a guest package; the
-# generated constants are GUEST_STAGE_*, LEZ_STAGE_* and KEYS_*, confirm in methods.rs):
+# generated constants are GUEST_STAGE_*, LEZ_STAGE_*, LEZ_ROOTED_*, KEYS_* and AGG_*, confirm in methods.rs):
 #   guest-stage (src/main.rs)  the staged update with simple inputs and outputs
 #   lez-stage                  the same steps with the LEZ input and output layout (lez_io.rs)
+#   lez-rooted                 the rooted steps (committee as a root, store v2) in the LEZ layout
 #   keys                       micro-benchmark of committee key decoding
+#   agg                        one begin-like step for the "committee as a root" design
 [[bin]]
 name = "lez-stage"
 path = "src/lez_stage.rs"
 
 [[bin]]
+name = "lez-rooted"
+path = "src/lez_rooted.rs"
+
+[[bin]]
 name = "keys"
 path = "src/keys.rs"
+
+[[bin]]
+name = "agg"
+path = "src/agg.rs"
 
 [dependencies]
 risc0-zkvm = { version = "=3.0.5", default-features = false, features = [

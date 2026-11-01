@@ -58,3 +58,11 @@ required-features = ["bls-zk"]
 name = "staged_update"
 path = "tests/staged_update.rs"
 required-features = ["bls-zk", "bls-blst"]
+
+# Differential suite for the ROOTED staged update: the rooted store with hints against the
+# full-store staged path and the single-shot bls-zk path. Needs both backends:
+#   cargo test -p le-sync-wire --features bls-zk,bls-blst --test rooted_update
+[[test]]
+name = "rooted_update"
+path = "tests/rooted_update.rs"
+required-features = ["bls-zk", "bls-blst"]

@@ -64,7 +64,7 @@ impl StageConfig {
     }
 
     /// `BadConfig` for an empty, over-long or unordered fork list.
-    fn sync_config(&self) -> Result<SyncConfig, Error> {
+    pub(crate) fn sync_config(&self) -> Result<SyncConfig, Error> {
         Ok(SyncConfig {
             chain: ChainConfig {
                 slots_per_epoch: self.slots_per_epoch,
@@ -118,6 +118,16 @@ fn with_update<R>(
 ) -> Result<R, Error> {
     let next: SyncCommittee = committee_from(&u.next_pubkeys, &u.next_aggregate, size)
         .ok_or(Error::BadSyncCommitteeSize)?;
+    with_next(u, &next, f)
+}
+
+/// `with_update` with the next committee already parsed (the rooted path builds it from a
+/// keys root instead of the keys). Everything else about the update is read from `u`.
+pub(crate) fn with_next<R>(
+    u: &UpdateWire,
+    next: &SyncCommittee,
+    f: impl FnOnce(&LightClientUpdate) -> Result<R, Error>,
+) -> Result<R, Error> {
     let sig: [u8; 96] = u
         .signature
         .as_slice()
@@ -132,7 +142,7 @@ fn with_update<R>(
     };
     let lcu = LightClientUpdate {
         attested_header: (&u.attested).into(),
-        next_sync_committee: &next,
+        next_sync_committee: next,
         next_sync_committee_branch: next_branch,
         finalized_header: (&u.finalized).into(),
         finality_branch: &u.finality_branch,
@@ -144,30 +154,34 @@ fn with_update<R>(
 }
 
 /// The strict gate of `process_update_strict`: below 2/3 participation is `BelowThreshold`.
-fn strict_gate(u: &LightClientUpdate) -> Result<(), Error> {
+pub(crate) fn strict_gate(u: &LightClientUpdate) -> Result<(), Error> {
     if !has_supermajority(u.sync_committee_bits) {
         return Err(Error::BelowThreshold);
     }
     Ok(())
 }
 
-fn encode(store: &LightClientStore) -> Result<Vec<u8>, Error> {
+pub(crate) fn encode(store: &LightClientStore) -> Result<Vec<u8>, Error> {
     let mut out = vec![0u8; MAX_ENCODED_LEN];
     let n = encode_store(store, &mut out)?;
     out.truncate(n);
     Ok(out)
 }
 
-/// The store `run_sync` builds from the bootstrap section of `i`, as `store_codec` bytes: the
-/// starting point of a staged run. Same errors as the bootstrap of `verify`.
-pub fn initial_store_bytes(i: &GuestInput, s: &SyncInput) -> Result<Vec<u8>, Error> {
+/// The store `run_sync` builds from the bootstrap section of `i`. Same errors as the bootstrap
+/// of `verify`.
+pub(crate) fn initial_store(i: &GuestInput, s: &SyncInput) -> Result<LightClientStore, Error> {
     let cfg = StageConfig::from_input(i, s).sync_config()?;
     let committee =
         committee_from(&i.pubkeys, &i.aggregate, 0).ok_or(Error::BadSyncCommitteeSize)?;
     let header = BeaconBlockHeader::from(&i.boot_header);
-    let store =
-        initialize_light_client_store(&cfg, &i.trusted_root, &header, committee, &i.boot_branch)?;
-    encode(&store)
+    initialize_light_client_store(&cfg, &i.trusted_root, &header, committee, &i.boot_branch)
+}
+
+/// The store `run_sync` builds from the bootstrap section of `i`, as `store_codec` bytes: the
+/// starting point of a staged run. Same errors as the bootstrap of `verify`.
+pub fn initial_store_bytes(i: &GuestInput, s: &SyncInput) -> Result<Vec<u8>, Error> {
+    encode(&initial_store(i, s)?)
 }
 
 /// Run one step. See the module docs for what each input does and which errors it returns.
@@ -497,7 +511,7 @@ mod tests {
         let (_, j2, _) = good_run(&s);
         let b = Staged::ok();
         let mut garbage = s.store.clone();
-        garbage[0] = 2; // version
+        garbage[0] = 9; // version (1 and 2 are both known)
         for bad in [vec![], garbage, s.store[..s.store.len() - 1].to_vec()] {
             let r = run_stage(
                 &s.cfg,

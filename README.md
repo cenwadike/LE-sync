@@ -1,7 +1,11 @@
 # le-sync: Logos-Ethereum Synchronizer (RFP-021 PoC)
 
-Prove an Ethereum account balance, storage value or event log inside a RISC Zero guest,
-starting from one trusted checkpoint, and save the result as a verifiable receipt. Nothing the beacon API or the execution RPC says is trusted.
+Prove an Ethereum account balance, storage value or event log inside a RISC Zero guest, starting
+from one trusted checkpoint, and save the result as a verifiable receipt. Nothing the beacon API
+or the execution RPC says is trusted.
+
+The same light-client logic also runs as three small steps (Begin, Miller, Finish) that each fit
+the per-transaction cycle cap of LEZ. That is the Sprint 6 work, in section 2.
 
 ---
 
@@ -28,11 +32,13 @@ Every arrow is checked in the guest. The host only fetches data.
 
 | Crate | Role |
 |---|---|
-| `core` | `no_std`, no alloc. SSZ branches, sync protocol, `exec` (header root), `rlp`, `mpt`, `state`, `receipt`, `predicate`, `statement`, `keccak` |
-| `wire` | Guest input/output types and `verify`. No risc0 dependency, testable natively |
-| `guest` | Thin zkVM wrapper around `wire` |
+| `core` | `no_std`, no alloc. SSZ branches, sync protocol, staged update (`update_job`, `multiproof`, `store_codec`), `exec` (header root), `rlp`, `mpt`, `state`, `receipt`, `predicate`, `statement`, `keccak` |
+| `wire` | Guest input/output types, `verify`, the staged steps (`stage`, `rooted`) and the BLS backends. No risc0 dependency, testable natively |
+| `guest` | Thin zkVM wrapper around `wire::verify` |
 | `host` | CLI. Fetches beacon, `eth_getProof` and `eth_getBlockReceipts` data, runs the guest, judges the journal, proves and verifies receipts |
-| `testkit` | Test-only reference trie and fixtures |
+| `guest-stage` | Guest programs for the staged steps: plain, LEZ layout, rooted (LEZ layout), and two micro-benchmarks |
+| `bench` | Execute-only cycle gate for the staged steps (`le_cost`). Own workspace |
+| `testkit` | Test-only reference trie, seeded committees, BLS signer and fixtures |
 | `vectors` | Replays the consensus-spec-tests against `core` |
 
 ### What the guest checks (state section)
@@ -41,7 +47,8 @@ Every arrow is checked in the guest. The host only fetches data.
 2. The supplied `ExecutionPayloadHeader` must hash into that header's `body_root` (gindex 25).
 3. `state_root` is read from that header. It is never an input.
 4. The account proof must verify under `state_root`. An absent account is a verified exclusion.
-5. The storage proof must verify under the `storageRoot` of the verified account, never under the RPC's `storageHash`.
+5. The storage proof must verify under the `storageRoot` of the verified account, never under the
+   RPC's `storageHash`.
 
 ### What the guest checks (log section)
 
@@ -102,14 +109,24 @@ the log data). Operators: `==`, `!=`. Example: `balance==0x1d939a6235e9dff0524d5
 
 ### Error codes
 
+Ranges: 1xx config, 2xx bootstrap, branches and proofs, 3xx update validity, 4xx signature,
+5xx policy and chain identity. Numbers are stable and never reused.
+
 | Code | Meaning |
 |---|---|
 | 101 | Unsupported fork (before Electra, or Gloas and later) |
+| 102 | Sync-committee size not a power of two within the maximum |
 | 201 | Branch does not verify (header, `execution_branch`, or forged state root) |
 | 203 | RLP malformed or not canonical |
 | 204 | Merkle-Patricia proof does not verify (state, storage or receipt) |
 | 205 | Log mismatch: failed receipt, no such log, or address or topics differ |
 | 206 | Predicate false (provisional) |
+| 300 to 307 | Update validity: committee size, participants, slot order, period, relevance, next committee |
+| 308 | Staged step called out of order |
+| 309 | Job does not belong to this update |
+| 310 | Store changed since Begin |
+| 311 | Store bytes are not a canonical `store_codec` encoding |
+| 312 | Rooted Begin: the absent keys are not acceptable (wrong members, off the curve, or not proven against the keys root) |
 | 400 | Bad sync-committee signature |
 | 501 | Participation below 2/3 |
 | 502 | Chain mismatch |
@@ -124,11 +141,89 @@ the log data). Operators: `==`, `!=`. Example: `balance==0x1d939a6235e9dff0524d5
 - The log needs an RPC that serves `eth_getBlockReceipts`. The host rebuilds the receipts trie and
   checks it against the header's `receipts_root` before calling the guest.
 - The proof is fetched at the newest finalized block. The RPC must serve state for it.
-- Keccak is software (`tiny-keccak`). Cycle cost is measured in Sprint 6.
+- Keccak is software (`tiny-keccak`).
 
 ---
 
-## 2. Setup
+## 2. Staged update (Sprint 6)
+
+LEZ stops a program at 32 MiB cycles (`33,554,432`, LEZ v0.1.2 public execution). One signature
+check costs more, so the update is split into three transactions:
+
+| Step | Does | Reads | Writes |
+|---|---|---|---|
+| Begin | Checks the update, hashes the message to the curve, aggregates the signing keys | store | job (641 bytes) |
+| Miller | The pairing's Miller loop | job | job |
+| Finish | Final exponentiation, then applies the update | store, job | new store |
+
+The job holds the step, digests of the store and the update, and the intermediate pairing state.
+It is unauthenticated, so it must live in an account only the program can write (M2).
+
+### Committee as a root
+
+The first design stored the committee's keys in the store account. Account data costs about 454
+cycles per byte per step, and each key costs 92,132 cycles to decompress, so Begin and Finish were
+over the cap. The store now holds only the committee's keys root and aggregate (`store_codec` v2,
+403 bytes). Begin is sent what it needs:
+
+- the keys of the **absent** members, as 96-byte uncompressed points packed into `u32` words;
+- one Merkle multiproof binding them to the keys root (SSZ tree, depth 9, leaf = `pubkey_root`).
+
+The signing key is the committee aggregate minus the absent keys. Their positions must equal the
+zero bits of the participation bits, and the 2/3 gate guarantees fewer absent than present. Each
+hinted key is checked on the curve and recompressed, so the leaf proven is the committed one. A
+handoff update carries the next committee as its keys root and a 48-byte aggregate.
+`store_codec` still decodes v1.
+
+### Cost (measured)
+
+`le_cost --rooted --committee 512 --input lez --cap 33554432`, executor cycles, run 2026-11-01:
+
+| Scenario | Signers | Begin | Miller | Finish | Worst step |
+|---|---|---|---|---|---|
+| `full` | 512 | 4,323,830 | 4,825,029 | 7,388,856 | 22.0% of cap |
+| `min` | 342 | 9,430,205 | 4,825,029 | 7,388,856 | 28.1% of cap |
+| `handoff` | 342 | 9,333,079 | 4,825,029 | 7,110,912 | 27.8% of cap |
+
+Before the rooted design (committee keys in the store): `min` Begin 44.29M, `handoff` Begin
+55.10M and Finish 41.12M, all over the cap.
+
+What is and is not measured: the bench replicates the LEZ account and `ProgramOutput` layout
+(`guest-stage/src/lez_io.rs`, from v0.1.2). It does not use the real `nssa_core` types or the real
+executor path, and nothing is proved. M2 must run the real program and compare. Open: the
+transaction size limit (the `min` Begin update is 17,436 bytes), the testnet 0.4 cap, and the image
+ID on Linux.
+
+### Run
+
+```sh
+source scripts/env.sh
+le_cost --rooted --committee 512 --scenario min --input lez --cap 33554432
+le_cost --rooted --committee 512 --scenario handoff --input lez --cap 33554432
+le_cost --rooted --committee 512 --scenario full --input lez --cap 33554432
+```
+
+`le_cost` runs `bench/`, passes every flag through, prints `cost: PASS ...` and sets `COST_BEGIN`,
+`COST_MILLER` and `COST_FINISH`. It fails if a step is over `--cap`, or if a guest result differs
+from the native one (byte for byte, including the error code). Without `--rooted` it measures the
+old design.
+
+| Bench flag | Use |
+|---|---|
+| `--committee N` | Power of two from 8 to 512 (default 512) |
+| `--scenario S` | `full`, `min` (fewest signers the gate accepts, default) or `handoff` (also carries the next committee) |
+| `--rooted` | The rooted design. Implies `--input lez` |
+| `--input plain\|lez` | Read and commit directly, or as a LEZ program does (accounts, instruction words, whole output) |
+| `--cap N` | Cycle cap to compare against |
+| `--detail` | Print each step's guest log (per-phase cycles) |
+| `--keys N`, `--agg N [--pack]` | Micro-benchmarks: key decoding, and one rooted Begin-like step |
+
+Run the bench from its own manifest: it is its own workspace because `bls-blst` (the risc0 fork of
+`blst`) and `le-sync-vectors` (crates.io `blst`) cannot be built together.
+
+---
+
+## 3. Setup
 
 ```sh
 # optional: pick your own execution RPC (must serve eth_getProof and eth_getBlockReceipts).
@@ -145,7 +240,7 @@ independent sources before you rely on a result. Override any variable before so
 
 ---
 
-## 3. Run
+## 4. Run
 
 ### One command per task
 
@@ -162,6 +257,7 @@ independent sources before you rely on a result. Override any variable before so
 | `le_log_all` | `le_log`, `le_log_tamper`, `le_log_predicate`, `le_log_replay` |
 | `le_prove [state\|log]` | Executes, proves, saves `./receipts/<kind>.receipt`, then verifies the saved file |
 | `le_verify_receipt <file> [state\|log]` | Verifies a saved receipt and judges its journal, offline |
+| `le_cost [flags]` | Cycle gate for the staged steps (section 2) |
 | `le` | Raw host CLI, any flags |
 
 ```sh
@@ -179,10 +275,8 @@ verify: block 26262717
 verify: PASS
 ```
 
-After `le_verify` these shell variables hold the values:
-`BLOCK`, `G_BALANCE`, `G_VALUE` (from the guest), `I_BALANCE`, `I_VALUE` (from the RPC).
-
-The independent check needs the block the host chose, so it runs after the proof, not at setup.
+After `le_verify`: `BLOCK`, `G_BALANCE`, `G_VALUE` (from the guest), `I_BALANCE`, `I_VALUE` (from the
+RPC). The independent check needs the block the host chose, so it runs after the proof.
 
 ### Log
 
@@ -195,17 +289,9 @@ le_log --predicate data0==0x2710             # amount equals 10000
 le_log_all
 ```
 
-`le_log` prints one result block and exits non-zero on any mismatch:
-
-```
-log: block <N>, transaction <i>, log <j>
-  statement id 0x...
-  address, topics, data length  OK        0x... 0x...
-log: PASS
-```
-
-After `le_log`: `L_BLOCK`, `L_TX`, `L_LOGINDEX`, `L_ADDR`, `L_TOPICS`, `L_DATALEN`, `L_DATAHASH`,
-`L_ID` (from the guest), `I_LOG` (from the RPC). The data itself is bound by `log_data_hash`.
+`le_log` prints a result block like `le_verify` and exits non-zero on any mismatch. After it:
+`L_BLOCK`, `L_TX`, `L_LOGINDEX`, `L_ADDR`, `L_TOPICS`, `L_DATALEN`, `L_DATAHASH`, `L_ID` (from the
+guest), `I_LOG` (from the RPC). The data itself is bound by `log_data_hash`.
 
 ### Prove and verify a receipt
 
@@ -225,24 +311,20 @@ Pass the same extra flags to `le_verify_receipt` as to the run (for example the 
 Each task above expands to these (`le` is a shell function from `env.sh`):
 
 ```sh
-# balance proof (balance is always proven with the account)
+# balance proof (always proven with the account), and storage inclusion proof
 le --source $B --trusted-root $R --address $ADDR --execution-rpc $X --save-dir ./fixture
-
-# storage inclusion proof
 le --source $B --trusted-root $R --address $ADDR --slot $SLOT --execution-rpc $X --save-dir ./fixture
 
 # enforce expected values (hex, left-padded). Exit 0 only if the guest's values equal them
 le --source $B --trusted-root $R --address $ADDR --slot $SLOT --execution-rpc $X \
    --expect-value 0x<value> --expect-balance 0x<balance>
 
-# tampered root must fail
+# tampered state must fail
 le --source $B --trusted-root $R --address $ADDR --slot $SLOT --execution-rpc $X --tamper-exec    # 201
 le --source $B --trusted-root $R --address $ADDR --slot $SLOT --execution-rpc $X --tamper-state   # 204
 
-# log: first matching log in the finalized block
+# log: first matching log in the finalized block; pinned position, predicate, expected ID
 le --source $B --trusted-root $R --execution-rpc $X --log-address $LOGADDR --log-topic0 $TOPIC0
-
-# log: pinned position, predicate, expected statement ID
 le --source $B --trusted-root $R --execution-rpc $X --log-address $LOGADDR --log-topic0 $TOPIC0 \
    --log-tx 130 --log-index 2 --predicate data0==0x2710 --expect-id 0x<id>
 
@@ -263,7 +345,7 @@ le --source ./fixture --trusted-root $(cat ./fixture/trusted_root) --address $AD
 A slot value of all zeros means the slot is empty (a verified exclusion). Pick a slot with a
 non-zero value to test inclusion.
 
-### Sync only (Sprints 1 to 3)
+### Sync only
 
 ```sh
 le --source $B --trusted-root $R                          # bootstrap + branches
@@ -278,8 +360,10 @@ le --source $B --trusted-root $R --tamper                 # flip a bit in every 
 
 ```sh
 # unit tests
-cargo test -p le-sync-core                                 # core: 0 failures expected
+cargo test -p le-sync-core                                 # 0 failures expected
 cargo test -p le-sync-wire
+cargo test -p le-sync-wire --features bls-zk,bls-blst --test staged_update --test rooted_update
+cargo test --manifest-path bench/Cargo.toml                # argument parsing and the report
 RISC0_SKIP_BUILD=1 cargo test -p le-sync -p le-sync-wire   # host and wire, no guest build
 cargo test --workspace                                     # everything (builds the guest)
 
@@ -288,7 +372,7 @@ cargo test --workspace                                     # everything (builds 
 cargo mutants -p le-sync-wire
 cargo mutants -p le-sync
 
-# live (network): log, tamper, predicate, replay
+# live (network)
 source scripts/env.sh
 le_log_all
 
@@ -303,9 +387,13 @@ cargo run -p le-sync-vectors --release -- <consensus-spec-tests dir> minimal
 cargo run -p le-sync-vectors --release -- <consensus-spec-tests dir> mainnet
 ```
 
+`staged_update` and `rooted_update` compare the staged runs with the single-shot `run`: same
+accept or reject, same error, same resulting store. `rooted_update` also covers tampered hints
+(every key and proof word), and a rooted store used with the full-key path.
+
 ---
 
-## 4. Flags
+## 5. Flags
 
 | Flag | Use |
 |---|---|
@@ -318,13 +406,13 @@ cargo run -p le-sync-vectors --release -- <consensus-spec-tests dir> mainnet
 | `--expect-balance 0x..` | Journal balance must equal this (wei) |
 | `--tamper-state` | Corrupt the account proof. Guest must reject with 204 |
 | `--tamper-exec` | Corrupt the execution state root and receipts root. Guest must reject with 201 |
+| `--tamper-receipt` | Corrupt the receipt proof. Guest must reject with 204 |
 | `--log-address 0x..` | Prove a log emitted by this contract. Needs `--execution-rpc` |
 | `--log-topic0..3 0x..` | Require this topic at that position |
 | `--log-tx N\|0x<hash>` | Transaction in the block: decimal index or hash. Default: first match |
 | `--log-index N` | Log position within the receipt. Default 0. Needs `--log-tx` |
 | `--predicate <t><op><v>` | Equality or inequality over a verified value. Routed to the state or log by target |
 | `--expect-id 0x..` | Journal statement ID must equal this (log ID if a log is requested, else storage ID) |
-| `--tamper-receipt` | Corrupt the receipt proof. Guest must reject with 204 |
 | `--prove` | After a successful execute, prove the run and verify the receipt. Needs `--receipt-out` |
 | `--receipt-out FILE` | With `--prove`: write the receipt here |
 | `--verify-receipt FILE` | Verify a saved receipt and judge its journal. Give the flags of the original run |
@@ -335,7 +423,7 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 
 ---
 
-## 5. If it fails
+## 6. If it fails
 
 | You see | Cause | Do |
 |---|---|---|
@@ -345,16 +433,21 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 | `NOT OK ... error code 203` or `204` | Proof payload or its encoding does not verify | Keep `./fixture` and report it |
 | `NOT OK ... error code 205` | No matching log at that position, or the receipt failed | Check `--log-tx`, `--log-index`, address and topics |
 | `NOT OK ... error code 206` | The predicate is false for the verified value | Check the operand. Expected for a false predicate |
+| `NOT OK ... error code 101` | Fork not supported | Use an Electra or Fulu network |
 | `receipts root` mismatch (host) | The RPC's receipts do not rebuild the header's `receipts_root` | Use another provider. An unsupported receipt type is a possible cause |
 | `eth_getBlockReceipts` errors | RPC does not serve block receipts | Use another provider or a full node |
 | `RISC0_DEV_MODE is set` | Dev-mode receipts are fake | Unset it, then prove or verify |
 | `does not verify against this build's guest image ID` | Receipt made by another guest build, or not a valid proof | Rebuild the same guest, or re-prove |
-| `NOT OK ... error code 101` | Fork not supported | Use an Electra or Fulu network |
 | `trusted root` errors | Checkpoint is stale or wrong | Take a fresh `$R` |
+| `cost: FAIL (bench exit 101)` with `can't find bin` | A file named in `guest-stage/Cargo.toml` is missing | Check `ls guest-stage/src` against the `[[bin]]` paths |
+| `cost: FAIL` with `MISMATCH` | The guest and the native run disagree | Report the step and both results |
+| `cost: FAIL` with `a step is over the cap` | A step exceeds `--cap` | Read the table: which step, and how far |
 
 ---
 
-#### Verified run (mainnet, 2026-10-24)
+## Verified runs
+
+### Mainnet, 2026-10-24
 
 | Item | Value |
 |---|---|
@@ -364,7 +457,7 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 | Slot `0x0` | `0x5772617070656420457468657200...1a` ("Wrapped Ether"), equals `eth_getStorageAt` |
 | Tamper runs | 201 and 204, as expected |
 
-#### Cycles (execute only)
+### Cycles, single-shot guest (execute only)
 
 | Part | Cycles |
 |---|---|
@@ -374,3 +467,5 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 | State: anchor | 50K |
 | State: account proof | 568K |
 | State: storage proof | 453K |
+
+The staged steps in section 2 are the version of the sync part that fits the LEZ cap.

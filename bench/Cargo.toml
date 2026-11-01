@@ -21,12 +21,17 @@ le-sync-testkit = { path = "../testkit" }
 risc0-zkvm = "=3.0.5"
 # The host side of ../guest-stage/src/lez_io.rs (included by path) derives serde.
 serde = { version = "1", features = ["derive"] }
+# `--agg` builds the committee tree and the multiproof on the host.
+sha2 = "0.10"
+# Same git and tag as the optional `blst` in ../wire (one package, `links = "blst"`): the host
+# makes the uncompressed key points the guest checks.
+blst = { git = "https://github.com/risc0/blst", tag = "blst/v0.3.14-risczero.0" }
 
 [build-dependencies]
 risc0-build = "=3.0.5"
 
-# risc0-build compiles ../guest-stage (package name `guest-stage`), which has three binaries:
-# guest-stage, lez-stage and keys. The generated constants are expected to be GUEST_STAGE_*,
-# LEZ_STAGE_* and KEYS_* (each ELF and ID); confirm in the generated methods.rs.
+# risc0-build compiles ../guest-stage (package name `guest-stage`), which has five binaries:
+# guest-stage, lez-stage, lez-rooted, keys and agg. The generated constants are GUEST_STAGE_*,
+# LEZ_STAGE_*, LEZ_ROOTED_*, KEYS_* and AGG_* (each ELF and ID); see the generated methods.rs.
 [package.metadata.risc0]
 methods = ["../guest-stage"]

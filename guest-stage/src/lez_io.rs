@@ -25,6 +25,7 @@
 //! run the real program through the real executor path and compare.
 #![allow(dead_code)]
 
+use le_sync_wire::rooted::{AbsentWire, RootedUpdate};
 use le_sync_wire::UpdateWire;
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +152,32 @@ impl LezOp {
     }
 }
 
+/// The rooted design's instruction (`lez_rooted.rs`): the same three steps over a store that
+/// holds the committee as a root (`store_codec` v2). Begin carries the hints for the absent
+/// keys; the committee's keys are not in the account and not in the update.
+///   Begin  : accounts [store, job slot (empty)]   Miller: [job]   Finish: [store, job]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootedOp {
+    Begin {
+        update: RootedUpdate,
+        absent: AbsentWire,
+    },
+    Miller,
+    Finish {
+        update: RootedUpdate,
+    },
+}
+
+impl RootedOp {
+    pub fn mode(&self) -> &'static str {
+        match self {
+            RootedOp::Begin { .. } => "begin",
+            RootedOp::Miller => "miller",
+            RootedOp::Finish { .. } => "finish",
+        }
+    }
+}
+
 /// A program-owned account holding `data`, as an input account (`tag` makes the id differ).
 pub fn meta(tag: u8, data: Vec<u8>) -> AccountWithMetadata {
     AccountWithMetadata {
@@ -174,4 +201,70 @@ pub fn post(like: &AccountWithMetadata, data: Vec<u8>) -> AccountPostState {
         },
         claim: None,
     }
+}
+
+/// Instruction of the `agg` measurement: the committee keys an update needs, each as the 96-byte
+/// uncompressed point (the y-hint), their positions in the 512-leaf committee tree (ascending),
+/// and the Merkle multiproof siblings (32 bytes each) that bind them to the stored root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggInput {
+    pub keys: Vec<Vec<u8>>,
+    pub index: Vec<u16>,
+    pub proof: Vec<Vec<u8>>,
+}
+
+/// The same instruction with the bytes packed four to a `u32`. The platform serializes a
+/// `Vec<u8>` as one serde element per byte, so the cost of an instruction is per element, not per
+/// byte; four bytes per element should cost about a quarter. `keys` is 24 words per key, `proof`
+/// 8 words per sibling (little-endian).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggPacked {
+    pub keys: Vec<u32>,
+    pub index: Vec<u16>,
+    pub proof: Vec<u32>,
+}
+
+fn words_of(chunks: &[Vec<u8>]) -> Vec<u32> {
+    chunks
+        .iter()
+        .flat_map(|c| c.chunks_exact(4))
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect()
+}
+
+fn chunks_of(words: &[u32], words_per_chunk: usize) -> Vec<Vec<u8>> {
+    words
+        .chunks_exact(words_per_chunk)
+        .map(|c| c.iter().flat_map(|w| w.to_le_bytes()).collect())
+        .collect()
+}
+
+impl AggPacked {
+    /// Pack `i` (96-byte keys, 32-byte siblings).
+    pub fn pack(i: &AggInput) -> Self {
+        Self {
+            keys: words_of(&i.keys),
+            index: i.index.clone(),
+            proof: words_of(&i.proof),
+        }
+    }
+
+    /// The bytes form, or `None` if the word counts do not fit 96-byte keys and 32-byte siblings.
+    pub fn unpack(&self) -> Option<AggInput> {
+        if self.keys.len() % 24 != 0 || self.proof.len() % 8 != 0 {
+            return None;
+        }
+        Some(AggInput {
+            keys: chunks_of(&self.keys, 24),
+            index: self.index.clone(),
+            proof: chunks_of(&self.proof, 8),
+        })
+    }
+}
+
+/// What the `agg` program is sent: either form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggMsg {
+    Bytes(AggInput),
+    Packed(AggPacked),
 }

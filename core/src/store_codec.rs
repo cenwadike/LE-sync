@@ -22,6 +22,27 @@
 //! `validate_light_client_update` rejects any other size). Sizes: 3,413 bytes for 32 keys,
 //! 49,493 for 512.
 //!
+//! Layout, version 2 (ROOTED, all integers little-endian): the same store with each committee
+//! reduced to the root of its key tree and its aggregate key (`SyncCommittee::rooted`). The
+//! keys are not stored; an update supplies the ones it needs, proven against the root
+//! (`multiproof`, `update_job::begin_update_rooted`). Fixed length, 403 bytes at any size:
+//!
+//! ```text
+//! version                       u8   = 2
+//! finalized_header              112
+//! optimistic_header             112
+//! previous_max_active           u64
+//! current_max_active            u64
+//! len                           u16   committee length, shared by both
+//! current_sync_committee        keys_root:32, aggregate_pubkey:48
+//! next_sync_committee           keys_root:32, aggregate_pubkey:48   (all zero: not known yet)
+//! ```
+//!
+//! A store is written as v2 when its current committee is rooted, as v1 otherwise. Mixing (a
+//! rooted committee next to a full one that is not empty) is not encodable. An all-zero next
+//! committee decodes as an empty one, so a next committee whose root and aggregate are both
+//! zero does not round-trip (it is empty by `is_empty` either way).
+//!
 //! Recorded decision: `best_valid_update` is NOT stored. It only feeds
 //! `LightClientStore::force_update`, a liveness fallback after a full period without
 //! finality; a store restored from these bytes starts with `None`. Keys past `len` are not
@@ -30,8 +51,15 @@
 use crate::sync::{LightClientStore, SyncCommittee};
 use crate::{BeaconBlockHeader, Bytes32, Error, MAX_SYNC_COMMITTEE_SIZE};
 
-/// The only version this crate reads or writes.
+/// The full-committee layout (version 1).
 pub const STORE_CODEC_VERSION: u8 = 1;
+
+/// The rooted layout (version 2).
+pub const ROOTED_CODEC_VERSION: u8 = 2;
+
+/// Encoded length of a rooted store: `1 + 2 * 112 + 8 + 8 + 2 + 2 * (32 + 48)`.
+pub const ROOTED_ENCODED_LEN: usize = 1 + 2 * HEADER_LEN + 8 + 8 + 2 + 2 * (32 + 48);
+const _: () = assert!(ROOTED_ENCODED_LEN == 403);
 
 /// Encoded `BeaconBlockHeader`: `8 + 8 + 32 + 32 + 32`.
 pub const HEADER_LEN: usize = 112;
@@ -69,8 +97,15 @@ fn put_committee(sink: &mut impl FnMut(&[u8]), c: &SyncCommittee) {
 /// and `update_job::store_digest` hashes them. Fails with `StoreEncoding` (before calling
 /// `sink`) if the committee lengths are not valid and equal.
 pub fn write_store(store: &LightClientStore, mut sink: impl FnMut(&[u8])) -> Result<(), Error> {
+    if store.current_sync_committee.is_rooted() {
+        return write_rooted(store, sink);
+    }
     let n = store.current_sync_committee.len;
-    if !valid_committee_len(n) || store.next_sync_committee.len != n {
+    // v1 writes keys: a rooted next committee has none to write
+    if !valid_committee_len(n)
+        || store.next_sync_committee.len != n
+        || store.next_sync_committee.is_rooted()
+    {
         return Err(Error::StoreEncoding);
     }
     sink(&[STORE_CODEC_VERSION]);
@@ -80,6 +115,30 @@ pub fn write_store(store: &LightClientStore, mut sink: impl FnMut(&[u8])) -> Res
     sink(&store.current_max_active_participants.to_le_bytes());
     put_committee(&mut sink, &store.current_sync_committee);
     put_committee(&mut sink, &store.next_sync_committee);
+    Ok(())
+}
+
+fn put_rooted(sink: &mut impl FnMut(&[u8]), c: &SyncCommittee) {
+    sink(&c.stored_keys_root().unwrap_or([0u8; 32]));
+    sink(&c.aggregate_pubkey);
+}
+
+/// The v2 body. The next committee must be rooted or empty (it has no keys to write either way).
+fn write_rooted(store: &LightClientStore, mut sink: impl FnMut(&[u8])) -> Result<(), Error> {
+    let cur = &store.current_sync_committee;
+    let next = &store.next_sync_committee;
+    let n = cur.len;
+    if !valid_committee_len(n) || next.len != n || !(next.is_rooted() || next.is_empty()) {
+        return Err(Error::StoreEncoding);
+    }
+    sink(&[ROOTED_CODEC_VERSION]);
+    put_header(&mut sink, &store.finalized_header);
+    put_header(&mut sink, &store.optimistic_header);
+    sink(&store.previous_max_active_participants.to_le_bytes());
+    sink(&store.current_max_active_participants.to_le_bytes());
+    sink(&(n as u16).to_le_bytes());
+    put_rooted(&mut sink, cur);
+    put_rooted(&mut sink, next);
     Ok(())
 }
 
@@ -141,6 +200,18 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// A rooted committee of `n` keys (v2). `zero_is_empty`: an all-zero entry is the empty
+    /// committee (the next committee not known yet).
+    fn rooted_committee(&mut self, n: usize, zero_is_empty: bool) -> Result<SyncCommittee, Error> {
+        let root = self.b32()?;
+        let mut agg = [0u8; 48];
+        agg.copy_from_slice(self.take(48)?);
+        if zero_is_empty && root == [0u8; 32] && agg == [0u8; 48] {
+            return Ok(SyncCommittee::empty(n));
+        }
+        SyncCommittee::rooted(n, root, agg).map_err(|_| Error::StoreEncoding)
+    }
+
     /// A committee of exactly `expect` keys if given, else of whatever valid length it states.
     fn committee(&mut self, expect: Option<usize>) -> Result<SyncCommittee, Error> {
         let mut l = [0u8; 2];
@@ -158,23 +229,35 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Decode a store. Accepts only the canonical v1 encoding: right version, valid equal
+/// Decode a store. Accepts only the canonical v1 or v2 encoding: right version, valid equal
 /// committee lengths, no truncation, no trailing bytes. Everything else is `StoreEncoding`.
-/// The result has `best_valid_update == None`.
+/// A v2 store decodes with rooted committees. The result has `best_valid_update == None`.
 pub fn decode_store(bytes: &[u8]) -> Result<LightClientStore, Error> {
     if bytes.len() > MAX_ENCODED_LEN {
         return Err(Error::StoreEncoding);
     }
     let mut r = Reader { bytes, pos: 0 };
-    if r.take(1)?[0] != STORE_CODEC_VERSION {
+    let version = r.take(1)?[0];
+    if version != STORE_CODEC_VERSION && version != ROOTED_CODEC_VERSION {
         return Err(Error::StoreEncoding);
     }
     let finalized_header = r.header()?;
     let optimistic_header = r.header()?;
     let previous_max_active_participants = r.u64()?;
     let current_max_active_participants = r.u64()?;
-    let current_sync_committee = r.committee(None)?;
-    let next_sync_committee = r.committee(Some(current_sync_committee.len))?;
+    let (current_sync_committee, next_sync_committee) = if version == ROOTED_CODEC_VERSION {
+        let mut l = [0u8; 2];
+        l.copy_from_slice(r.take(2)?);
+        let n = u16::from_le_bytes(l) as usize;
+        if !valid_committee_len(n) {
+            return Err(Error::StoreEncoding);
+        }
+        (r.rooted_committee(n, false)?, r.rooted_committee(n, true)?)
+    } else {
+        let current = r.committee(None)?;
+        let next = r.committee(Some(current.len))?;
+        (current, next)
+    };
     if r.pos != bytes.len() {
         return Err(Error::StoreEncoding);
     }
@@ -378,7 +461,7 @@ mod tests {
     #[test]
     fn decode_rejects_other_versions() {
         let b = enc(&busy_store());
-        for v in [0u8, 2, 0xFF] {
+        for v in [0u8, 3, 0xFF] {
             let mut c = b.clone();
             c[0] = v;
             assert_eq!(
@@ -414,5 +497,150 @@ mod tests {
         let mut c = b.clone();
         c[next_len_at..next_len_at + 2].copy_from_slice(&16u16.to_le_bytes());
         assert_eq!(decode_store(&c).err(), Some(Error::StoreEncoding));
+    }
+
+    // ---- v2: rooted committees ----
+
+    fn rooted_busy() -> LightClientStore {
+        busy_store().to_rooted().unwrap()
+    }
+
+    #[test]
+    fn rooted_size_is_fixed_and_small() {
+        assert_eq!(ROOTED_ENCODED_LEN, 403);
+        assert_eq!(enc(&rooted_busy()).len(), 403);
+        // the same at any committee size
+        let mut small = fixture().store.to_rooted().unwrap();
+        assert_eq!(small.current_sync_committee.len, N);
+        assert_eq!(enc(&small).len(), 403);
+        small.current_sync_committee = SyncCommittee::rooted(512, [1; 32], [2; 48]).unwrap();
+        small.next_sync_committee = SyncCommittee::empty(512);
+        assert_eq!(enc(&small).len(), 403);
+    }
+
+    #[test]
+    fn rooted_layout_is_byte_exact() {
+        let s = rooted_busy();
+        let b = enc(&s);
+        assert_eq!(b[0], 2);
+        // headers and counters sit where v1 puts them
+        let v1 = enc(&busy_store());
+        assert_eq!(&b[1..241], &v1[1..241]);
+        assert_eq!(&b[241..243], &[32, 0]);
+        let cur = &s.current_sync_committee;
+        let next = &s.next_sync_committee;
+        assert_eq!(&b[243..275], &cur.stored_keys_root().unwrap());
+        assert_eq!(&b[275..323], &cur.aggregate_pubkey);
+        assert_eq!(&b[323..355], &next.stored_keys_root().unwrap());
+        assert_eq!(&b[355..403], &next.aggregate_pubkey);
+        assert_ne!(
+            cur.stored_keys_root(),
+            next.stored_keys_root(),
+            "the test needs distinct roots"
+        );
+    }
+
+    #[test]
+    fn rooted_round_trips() {
+        let s = rooted_busy();
+        let d = decode_store(&enc(&s)).unwrap();
+        assert_eq!(d.finalized_header, s.finalized_header);
+        assert_eq!(d.optimistic_header, s.optimistic_header);
+        assert_eq!(
+            d.previous_max_active_participants,
+            s.previous_max_active_participants
+        );
+        assert_eq!(
+            d.current_max_active_participants,
+            s.current_max_active_participants
+        );
+        assert_eq!(d.current_sync_committee, s.current_sync_committee);
+        assert_eq!(d.next_sync_committee, s.next_sync_committee);
+        assert!(d.best_valid_update.is_none());
+        assert_eq!(enc(&d), enc(&s));
+    }
+
+    #[test]
+    fn a_rooted_store_with_no_next_committee_round_trips_as_empty() {
+        let s = fixture().store.to_rooted().unwrap();
+        assert!(!s.is_next_sync_committee_known());
+        let d = decode_store(&enc(&s)).unwrap();
+        assert!(!d.is_next_sync_committee_known());
+        assert!(!d.next_sync_committee.is_rooted());
+        assert_eq!(d.next_sync_committee.len, N);
+        assert!(d.current_sync_committee.is_rooted());
+        assert_eq!(d.current_sync_committee, s.current_sync_committee);
+    }
+
+    #[test]
+    fn a_zero_current_committee_stays_rooted_but_a_zero_next_is_empty() {
+        let mut s = rooted_busy();
+        s.current_sync_committee = SyncCommittee::rooted(N, [0; 32], [0; 48]).unwrap();
+        s.next_sync_committee = SyncCommittee::rooted(N, [0; 32], [0; 48]).unwrap();
+        let d = decode_store(&enc(&s)).unwrap();
+        assert!(d.current_sync_committee.is_rooted());
+        assert!(!d.next_sync_committee.is_rooted());
+        assert!(d.next_sync_committee.is_empty());
+    }
+
+    #[test]
+    fn a_full_and_a_rooted_committee_cannot_be_mixed() {
+        let mut out = vec![0u8; MAX_ENCODED_LEN];
+        // full current, rooted next: v1 would write zeros for the keys
+        let mut s = busy_store();
+        s.next_sync_committee = s.next_sync_committee.to_rooted().unwrap();
+        assert_eq!(encode_store(&s, &mut out), Err(Error::StoreEncoding));
+        // rooted current, full next that is not empty: v2 has no keys to write
+        let mut s = rooted_busy();
+        s.next_sync_committee = crate::sync::tests::committee(5);
+        assert_eq!(encode_store(&s, &mut out), Err(Error::StoreEncoding));
+        // rooted current, full next that IS empty: fine, written as unknown
+        let mut s = rooted_busy();
+        s.next_sync_committee = SyncCommittee::empty(N);
+        assert_eq!(encode_store(&s, &mut out), Ok(403));
+    }
+
+    #[test]
+    fn rooted_committee_lengths_must_be_valid_and_equal() {
+        let mut out = vec![0u8; MAX_ENCODED_LEN];
+        let mut s = rooted_busy();
+        s.current_sync_committee.len = 24;
+        s.next_sync_committee.len = 24;
+        assert_eq!(encode_store(&s, &mut out), Err(Error::StoreEncoding));
+        let mut s = rooted_busy();
+        s.next_sync_committee.len = 16;
+        assert_eq!(encode_store(&s, &mut out), Err(Error::StoreEncoding));
+        let b = enc(&rooted_busy());
+        for bad in [0u16, 24, 31, 33, 1024, 0xFFFF] {
+            let mut c = b.clone();
+            c[241..243].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(decode_store(&c).err(), Some(Error::StoreEncoding), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rooted_decode_rejects_every_truncation_and_any_trailing_byte() {
+        let b = enc(&rooted_busy());
+        for cut in 0..b.len() {
+            assert_eq!(
+                decode_store(&b[..cut]).err(),
+                Some(Error::StoreEncoding),
+                "cut {cut}"
+            );
+        }
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(decode_store(&long).err(), Some(Error::StoreEncoding));
+    }
+
+    #[test]
+    fn the_two_layouts_have_different_digest_input() {
+        let full = busy_store();
+        let rooted = full.to_rooted().unwrap();
+        let (mut a, mut b) = (vec![], vec![]);
+        write_store(&full, |p| a.extend_from_slice(p)).unwrap();
+        write_store(&rooted, |p| b.extend_from_slice(p)).unwrap();
+        assert_eq!((a[0], b[0]), (1, 2));
+        assert_ne!(a.len(), b.len());
     }
 }

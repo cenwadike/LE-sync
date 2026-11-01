@@ -15,6 +15,10 @@ use crate::report::min_participants;
 use le_sync_core::sync::{compute_domain, compute_signing_root, DOMAIN_SYNC_COMMITTEE};
 use le_sync_core::{BeaconBlockHeader, Bytes32};
 use le_sync_testkit as tk;
+use le_sync_wire::bls::uncompress_g1;
+use le_sync_wire::rooted::{
+    absent_wire, initial_rooted_store_bytes, to_rooted_update, AbsentWire, RootedUpdate,
+};
 use le_sync_wire::stage::{initial_store_bytes, StageConfig};
 use le_sync_wire::{GuestInput, SyncInput, UpdateWire, WireHeader};
 
@@ -30,6 +34,23 @@ pub struct World {
     /// `store_codec` v1 bytes of the bootstrap store.
     pub store: Vec<u8>,
     pub update: UpdateWire,
+    pub total: usize,
+    pub present: usize,
+    /// The bootstrap and clock the store was made from, for `build_rooted`.
+    input: GuestInput,
+    sync: SyncInput,
+    /// The committee's compressed keys, in order.
+    keys: Vec<[u8; 48]>,
+}
+
+/// The world as the rooted design sees it: the same bootstrap and update, with the committee as
+/// a root in the store (`store_codec` v2), the next committee as a root in the update, and the
+/// hints (keys of the absent members, their positions, one multiproof).
+pub struct RootedWorld {
+    pub cfg: StageConfig,
+    pub store: Vec<u8>,
+    pub update: RootedUpdate,
+    pub absent: AbsentWire,
     pub total: usize,
     pub present: usize,
 }
@@ -131,6 +152,28 @@ pub fn build(n: usize, scenario: &str) -> Result<World, String> {
         update,
         total: n,
         present,
+        input,
+        sync,
+        keys: cur.pubkeys.to_vec(),
+    })
+}
+
+/// The rooted form of `build(n, scenario)`.
+pub fn build_rooted(n: usize, scenario: &str) -> Result<RootedWorld, String> {
+    let w = build(n, scenario)?;
+    let store = initial_rooted_store_bytes(&w.input, &w.sync)
+        .map_err(|e| format!("rooted bootstrap store: error code {}", e.code()))?;
+    let update = to_rooted_update(&w.update)
+        .map_err(|e| format!("rooted update: error code {}", e.code()))?;
+    let absent = absent_wire(&w.keys, &w.update.bits, uncompress_g1)
+        .ok_or("the hints: a committee key does not uncompress")?;
+    Ok(RootedWorld {
+        cfg: w.cfg,
+        store,
+        update,
+        absent,
+        total: w.total,
+        present: w.present,
     })
 }
 
@@ -144,4 +187,13 @@ pub fn update_bytes(u: &UpdateWire) -> usize {
         + u.bits.len()
         + u.signature.len()
         + 8
+}
+
+/// Payload bytes of a rooted update as it travels: the update (next committee as a root and an
+/// aggregate), and the hints (4 bytes a word, 2 bytes an index).
+pub fn rooted_update_bytes(u: &RootedUpdate, a: &AbsentWire) -> usize {
+    update_bytes(&u.update)
+        + u.next_keys_root.map_or(0, |_| 32)
+        + 4 * (a.keys.len() + a.proof.len())
+        + 2 * a.index.len()
 }

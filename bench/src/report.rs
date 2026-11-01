@@ -17,7 +17,13 @@ usage: cargo run --manifest-path bench/Cargo.toml --release -- [flags]
                   lez    the guest reads and commits as a real LEZ program does: accounts, instruction
                          words, and the whole output echoed (`ProgramOutput`); see guest-stage/src/lez_io.rs
   --cap N         per-transaction cycle cap to compare against (LEZ v0.1.2 public execution: 33554432)
+  --rooted        run the rooted design (guest-stage/src/lez_rooted.rs): the store holds the committee
+                  as a root, Begin carries the absent keys and one multiproof. Implies --input lez
   --keys N        instead of the steps, measure decoding N committee keys (compressed vs hinted)
+  --pack          with --agg: send the keys and proof packed four bytes to a word
+  --agg N         instead of the steps, measure one begin-like step of the 'committee as a root'
+                  design: the account holds a 32-byte root, the update carries N absent keys
+                  (uncompressed) and one Merkle multiproof (N from 1 to 256)
   --detail        also print each step's guest log (the bls-blst phase breakdown)
   -h, --help      this text
 ";
@@ -28,6 +34,9 @@ pub struct Opts {
     pub scenario: String,
     pub input: String,
     pub keys: Option<usize>,
+    pub agg: Option<usize>,
+    pub pack: bool,
+    pub rooted: bool,
     pub cap: Option<u64>,
     pub detail: bool,
     pub help: bool,
@@ -46,6 +55,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
         scenario: "min".to_string(),
         input: "plain".to_string(),
         keys: None,
+        agg: None,
+        pack: false,
+        rooted: false,
         cap: None,
         detail: false,
         help: false,
@@ -58,6 +70,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
             "--committee" => o.committee = number("--committee", it.next())? as usize,
             "--cap" => o.cap = Some(number("--cap", it.next())?),
             "--keys" => o.keys = Some(number("--keys", it.next())? as usize),
+            "--pack" => o.pack = true,
+            "--rooted" => o.rooted = true,
+            "--agg" => o.agg = Some(number("--agg", it.next())? as usize),
             "--input" => {
                 o.input = it.next().ok_or("--input needs a value")?;
             }
@@ -86,6 +101,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, Strin
     }
     if o.keys.is_some_and(|k| !(1..=512).contains(&k)) {
         return Err("--keys: not a number from 1 to 512".to_string());
+    }
+    if o.agg.is_some_and(|k| !(1..=256).contains(&k)) {
+        return Err("--agg: not a number from 1 to 256".to_string());
     }
     if !(8..=512).contains(&o.committee) || !o.committee.is_power_of_two() {
         return Err(format!(
@@ -309,6 +327,9 @@ mod tests {
                 scenario: "min".to_string(),
                 input: "plain".to_string(),
                 keys: None,
+                agg: None,
+                pack: false,
+                rooted: false,
                 cap: None,
                 detail: false,
                 help: false
@@ -334,6 +355,13 @@ mod tests {
         .unwrap();
         assert_eq!(o.input, "lez");
         assert_eq!(o.keys, Some(170));
+        assert_eq!(args(&["--agg", "170"]).unwrap().agg, Some(170));
+        assert!(!args(&["--agg", "170"]).unwrap().pack);
+        assert!(args(&["--agg", "170", "--pack"]).unwrap().pack);
+        assert!(!args(&[]).unwrap().rooted);
+        assert!(args(&["--rooted", "--input", "lez"]).unwrap().rooted);
+        assert!(args(&["--agg", "0"]).unwrap_err().contains("1 to 256"));
+        assert!(args(&["--agg", "257"]).unwrap_err().contains("1 to 256"));
         assert_eq!(o.committee, 32);
         assert_eq!(o.scenario, "handoff");
         assert_eq!(o.cap, Some(10_000_000));
