@@ -9,12 +9,10 @@ license = "MIT or Apache-2.0"
 
 [workspace]
 resolver = "3"
-members = [
-  ".",
-  "methods",
-  "methods/guest",
-  "crates/lez-client-gen",
-]
+# methods/guest is its own workspace (see methods/guest/Cargo.toml): it needs the RISC Zero
+# sha2 patch and the blst fork, which must not apply to the host crates.
+exclude = ["methods/guest", "executor-tests"]
+members = [".", "methods", "crates/lez-client-gen"]
 
 [workspace.lints.rust]
 unsafe_code = "warn"
@@ -40,7 +38,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 clap = { version = "4.5.42", features = ["derive", "env"] }
-tokio = { version = "1.28.2", features = ["macros", "net", "rt-multi-thread", "sync", "fs"] }
+tokio = { version = "1.28.2", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "fs",
+] }
 borsh = { version = "1.5", features = ["derive"] }
 
 [dependencies]
@@ -53,5 +57,6 @@ spel-framework-core.workspace = true
 example_program_deployment_methods = { path = "methods" }
 
 serde.workspace = true
+hex.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["macros"] }

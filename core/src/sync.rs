@@ -629,6 +629,9 @@ pub fn check_light_client_update<'s>(
         if signature_period != store_period && signature_period != store_period + 1 {
             return Err(Error::PeriodSkipped);
         }
+    } else if signature_period == store_period + 1 {
+        // a handoff to a committee this store has not verified: its next committee is unknown
+        return Err(Error::HandoffNotVerified);
     } else if signature_period != store_period {
         return Err(Error::PeriodSkipped);
     }
@@ -1292,6 +1295,31 @@ pub(crate) mod tests {
             validate_fx(&f, &upd(&f, 130), 130),
             Err(Error::PeriodSkipped)
         );
+    }
+
+    #[test]
+    fn handoff_from_an_unknown_committee_is_its_own_error() {
+        // signature in period 1 (slots 64..128) while the store is in period 0 and its next
+        // committee is unknown: the signers are a committee this store has not verified
+        let f = fixture();
+        assert_eq!(
+            validate_fx(&f, &upd(&f, 70), 70),
+            Err(Error::HandoffNotVerified)
+        );
+        assert_eq!(
+            validate_fx(&f, &upd(&f, 127), 127),
+            Err(Error::HandoffNotVerified)
+        );
+        // two periods ahead is still a skipped period, and the same period is no handoff
+        assert_eq!(
+            validate_fx(&f, &upd(&f, 128), 128),
+            Err(Error::PeriodSkipped)
+        );
+        assert_ne!(
+            validate_fx(&f, &upd(&f, 63), 63),
+            Err(Error::HandoffNotVerified)
+        );
+        assert_ne!(validate_fx(&f, &upd(&f, 63), 63), Err(Error::PeriodSkipped));
     }
 
     #[test]

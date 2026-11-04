@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 extern crate self as le_sync_core;
 
 pub mod exec;
+pub mod header_record;
+pub mod instance;
 pub mod keccak;
 pub mod mpt;
 pub mod multiproof;
@@ -118,6 +120,35 @@ pub enum Error {
     /// acceptable: not the members the participation bits leave out, not points on the curve,
     /// or not proven against the committee's keys root (`multiproof`). Nothing was changed.
     AbsentKeys,
+    /// Instance configuration bytes (`instance`) are not the canonical encoding: wrong length
+    /// or version, an unordered or padded fork list, a zero epoch length, or a field that
+    /// does not re-encode to the same bytes.
+    InstanceEncoding,
+    /// `init_instance` found an account that is already written. The configuration is
+    /// written once and never changed.
+    AlreadyInitialized,
+    /// Header record bytes or a record log (`header_record`) are malformed: wrong length or
+    /// version, or two different records for one header.
+    HeaderRecordEncoding,
+    /// No record for that header root: it was never stored (not a finalized header of this
+    /// instance), or it has been evicted from the log.
+    HeaderNotFound,
+    /// A handoff (an update that moves to the next sync committee) was offered to a store
+    /// whose next committee this instance has not verified: the committee the update hands
+    /// off to is not one the instance has seen proven. Nothing was changed.
+    HandoffNotVerified,
+    /// An instance ID or an account seed given to the program is not the one derived from the
+    /// instance configuration. Nothing was changed.
+    InstanceIdMismatch,
+    /// An instruction argument does not decode (an update, a hint set, an execution header or a
+    /// claim), or a claim is not of the kind the instruction takes.
+    InstructionEncoding,
+    /// The statement ID given as the statement account's seed is not the one the verified claim
+    /// has.
+    StatementIdMismatch,
+    /// The clock account given to the program is not the LEZ clock account, or its data is not
+    /// a clock record.
+    ClockAccount,
 }
 
 /// Stable numeric error code. Numbers are part of the public contract (dry-run and on-chain
@@ -127,7 +158,7 @@ pub type ErrorCode = u16;
 impl Error {
     /// Every variant, for coverage tests. Keep in sync with the enum; `code()` and
     /// `message()` are exhaustive matches, so a new variant fails to compile until it has both.
-    pub const ALL: [Error; 27] = [
+    pub const ALL: [Error; 36] = [
         Error::BadConfig,
         Error::UnsupportedFork,
         Error::BadSyncCommitteeSize,
@@ -155,6 +186,15 @@ impl Error {
         Error::StoreChanged,
         Error::StoreEncoding,
         Error::AbsentKeys,
+        Error::InstanceEncoding,
+        Error::AlreadyInitialized,
+        Error::HeaderRecordEncoding,
+        Error::HeaderNotFound,
+        Error::HandoffNotVerified,
+        Error::InstanceIdMismatch,
+        Error::InstructionEncoding,
+        Error::StatementIdMismatch,
+        Error::ClockAccount,
     ];
 
     /// Stable code. Ranges: 1xx config, 2xx bootstrap/branches, 3xx update validity,
@@ -184,6 +224,15 @@ impl Error {
             Error::StoreChanged => 310,
             Error::StoreEncoding => 311,
             Error::AbsentKeys => 312,
+            Error::InstanceEncoding => 313,
+            Error::AlreadyInitialized => 314,
+            Error::HeaderRecordEncoding => 315,
+            Error::HeaderNotFound => 316,
+            Error::HandoffNotVerified => 317,
+            Error::InstanceIdMismatch => 318,
+            Error::InstructionEncoding => 319,
+            Error::StatementIdMismatch => 320,
+            Error::ClockAccount => 321,
             Error::BadSignature => 400,
             Error::CheckpointStale => 500,
             Error::BelowThreshold => 501,
@@ -221,6 +270,15 @@ impl Error {
             Error::StoreChanged => "the light-client store changed since this update job was begun; begin the update again against the current store",
             Error::StoreEncoding => "store bytes are not a canonical v1 or v2 encoding, or the store cannot be encoded; the stored state is corrupt or from another version",
             Error::AbsentKeys => "the keys supplied for the absent committee members are not the members the participation bits leave out, are not valid points, or do not match the committee's keys root; rebuild the key hints and proof from the committee",
+            Error::InstanceEncoding => "instance configuration bytes are not the canonical encoding; the account is corrupt or from another version",
+            Error::AlreadyInitialized => "the instance is already initialized; its configuration is written once and cannot be changed",
+            Error::HeaderRecordEncoding => "header record bytes are malformed (wrong length or version, or conflicting records for one header); the account is corrupt",
+            Error::HandoffNotVerified => "the update hands off to a committee this instance has not verified; finalize an update that proves the next committee first",
+            Error::InstanceIdMismatch => "the instance ID or an account seed is not derived from the instance configuration; derive them from the configuration's ID",
+            Error::InstructionEncoding => "an instruction argument does not decode, or the claim is not of the kind this instruction takes",
+            Error::StatementIdMismatch => "the statement account's seed is not the statement ID of the verified claim; derive it from the chain ID, the block hash and the claim's key",
+            Error::ClockAccount => "the clock account is not the LEZ clock account, or does not hold a clock record; pass the account of the 1-block clock",
+            Error::HeaderNotFound => "no verified record for that header: it was not stored as a finalized header of this instance, or it has been evicted; update the instance past it, or attest against a newer header",
         }
     }
 }
@@ -984,7 +1042,7 @@ mod tests {
     #[test]
     fn error_code_numbering_is_pinned() {
         // Changing any of these is a breaking change to the public error contract.
-        let pinned: [(Error, ErrorCode); 27] = [
+        let pinned: [(Error, ErrorCode); 36] = [
             (Error::BadConfig, 100),
             (Error::UnsupportedFork, 101),
             (Error::BadSyncCommitteeSize, 102),
@@ -1008,6 +1066,15 @@ mod tests {
             (Error::StoreChanged, 310),
             (Error::StoreEncoding, 311),
             (Error::AbsentKeys, 312),
+            (Error::InstanceEncoding, 313),
+            (Error::AlreadyInitialized, 314),
+            (Error::HeaderRecordEncoding, 315),
+            (Error::HeaderNotFound, 316),
+            (Error::HandoffNotVerified, 317),
+            (Error::InstanceIdMismatch, 318),
+            (Error::InstructionEncoding, 319),
+            (Error::StatementIdMismatch, 320),
+            (Error::ClockAccount, 321),
             (Error::BadSignature, 400),
             (Error::CheckpointStale, 500),
             (Error::BelowThreshold, 501),

@@ -4,8 +4,9 @@ Prove an Ethereum account balance, storage value or event log inside a RISC Zero
 from one trusted checkpoint, and save the result as a verifiable receipt. Nothing the beacon API
 or the execution RPC says is trusted.
 
-The same light-client logic also runs as three small steps (Begin, Miller, Finish) that each fit
-the per-transaction cycle cap of LEZ. That is the Sprint 6 work, in section 2.
+The same light-client logic also runs on LEZ as the `eth_attest` program: an update in three small
+steps (Begin, Miller, Finish) that each fit the per-transaction cycle cap, and attestations of
+accounts, storage slots and logs against the stored headers. Sections 2 and 3 describe it.
 
 ---
 
@@ -38,6 +39,7 @@ Every arrow is checked in the guest. The host only fetches data.
 | `host` | CLI. Fetches beacon, `eth_getProof` and `eth_getBlockReceipts` data, runs the guest, judges the journal, proves and verifies receipts |
 | `guest-stage` | Guest programs for the staged steps: plain, LEZ layout, rooted (LEZ layout), and two micro-benchmarks |
 | `bench` | Execute-only cycle gate for the staged steps (`le_cost`). Own workspace |
+| `lez` | The `eth_attest` LEZ program (`methods/guest`), its host copy for the IDL (`src/lib.rs`), and `executor-tests` (own workspace) |
 | `testkit` | Test-only reference trie, seeded committees, BLS signer and fixtures |
 | `vectors` | Replays the consensus-spec-tests against `core` |
 
@@ -114,6 +116,7 @@ Ranges: 1xx config, 2xx bootstrap, branches and proofs, 3xx update validity, 4xx
 
 | Code | Meaning |
 |---|---|
+| 100 | Configuration invalid |
 | 101 | Unsupported fork (before Electra, or Gloas and later) |
 | 102 | Sync-committee size not a power of two within the maximum |
 | 201 | Branch does not verify (header, `execution_branch`, or forged state root) |
@@ -127,7 +130,17 @@ Ranges: 1xx config, 2xx bootstrap, branches and proofs, 3xx update validity, 4xx
 | 310 | Store changed since Begin |
 | 311 | Store bytes are not a canonical `store_codec` encoding |
 | 312 | Rooted Begin: the absent keys are not acceptable (wrong members, off the curve, or not proven against the keys root) |
+| 313 | Instance configuration is not canonical |
+| 314 | Instance already initialised |
+| 315 | Header records are malformed |
+| 316 | No record for that header (never finalized by this instance, or evicted) |
+| 317 | Handoff from a committee the instance has not verified |
+| 318 | Instance ID or an account seed is not derived from the configuration |
+| 319 | Instruction argument does not decode, or the claim is the wrong kind |
+| 320 | Statement seed is not the statement ID of the verified claim |
+| 321 | Not the LEZ clock account, or not a clock record |
 | 400 | Bad sync-committee signature |
+| 500 | Checkpoint older than the weak-subjectivity guideline |
 | 501 | Participation below 2/3 |
 | 502 | Chain mismatch |
 
@@ -157,7 +170,8 @@ check costs more, so the update is split into three transactions:
 | Finish | Final exponentiation, then applies the update | store, job | new store |
 
 The job holds the step, digests of the store and the update, and the intermediate pairing state.
-It is unauthenticated, so it must live in an account only the program can write (M2).
+It is unauthenticated, so it lives in an account only the program can write: one job account per
+update (section 3).
 
 ### Committee as a root
 
@@ -175,24 +189,33 @@ hinted key is checked on the curve and recompressed, so the leaf proven is the c
 handoff update carries the next committee as its keys root and a 48-byte aggregate.
 `store_codec` still decodes v1.
 
-### Cost (measured)
+### Cost (measured through the program)
 
-`le_cost --rooted --committee 512 --input lez --cap 33554432`, executor cycles, run 2026-11-01:
+Executor cycles per transaction of the real `eth_attest` program, committee of 512, cap 33,554,432
+(`cargo run --release --manifest-path lez/executor-tests/Cargo.toml --bin gas`, run 2026-11-03):
 
-| Scenario | Signers | Begin | Miller | Finish | Worst step |
-|---|---|---|---|---|---|
-| `full` | 512 | 4,323,830 | 4,825,029 | 7,388,856 | 22.0% of cap |
-| `min` | 342 | 9,430,205 | 4,825,029 | 7,388,856 | 28.1% of cap |
-| `handoff` | 342 | 9,333,079 | 4,825,029 | 7,110,912 | 27.8% of cap |
+| Instruction | Scenario | Cycles | Of the cap |
+|---|---|---:|---:|
+| `init_instance` | | 1,203,163 | 3.6% |
+| `begin_update` | `full` (512 sign) | 4,484,659 | 13.4% |
+| `miller_update` | any | 4,818,567 | 14.4% |
+| `finish_update` | `full` | 9,572,313 | 28.5% |
+| `begin_update` | `min` (342 sign) | 9,890,323 | 29.5% |
+| `finish_update` | `min` | 9,572,378 | 28.5% |
+| `begin_update` | `handoff` (342 sign, next committee) | 9,812,218 | 29.2% |
+| `finish_update` | `handoff` | 9,313,135 | 27.8% |
+| `attest_state` | account | 1,756,392 | 5.2% |
+| `attest_state` | storage | 1,875,853 | 5.6% |
+| `attest_log` | log | 2,731,657 | 8.1% |
 
-Before the rooted design (committee keys in the store): `min` Begin 44.29M, `handoff` Begin
-55.10M and Finish 41.12M, all over the cap.
+The worst step is `begin_update` at minimum participation, 29.5% of the cap. With the committee's
+keys in the store (the first design), the same `min` Begin cost 44.29M and `handoff` Finish 41.12M.
 
-What is and is not measured: the bench replicates the LEZ account and `ProgramOutput` layout
-(`guest-stage/src/lez_io.rs`, from v0.1.2). It does not use the real `nssa_core` types or the real
-executor path, and nothing is proved. M2 must run the real program and compare. Open: the
-transaction size limit (the `min` Begin update is 17,436 bytes), the testnet 0.4 cap, and the image
-ID on Linux.
+The execution-only bench (`le_cost`, below) measures the staged steps without the program around
+them. It runs the same steps over a copy of the LEZ account layout.
+
+Open: the transaction size limit (the `min` Begin update is 17,436 bytes), the testnet 0.4 cap, and
+the image ID on Linux.
 
 ### Run
 
@@ -206,7 +229,7 @@ le_cost --rooted --committee 512 --scenario full --input lez --cap 33554432
 `le_cost` runs `bench/`, passes every flag through, prints `cost: PASS ...` and sets `COST_BEGIN`,
 `COST_MILLER` and `COST_FINISH`. It fails if a step is over `--cap`, or if a guest result differs
 from the native one (byte for byte, including the error code). Without `--rooted` it measures the
-old design.
+first design (keys in the store).
 
 | Bench flag | Use |
 |---|---|
@@ -223,7 +246,81 @@ Run the bench from its own manifest: it is its own workspace because `bls-blst` 
 
 ---
 
-## 3. Setup
+## 3. LEZ program (`eth_attest`)
+
+One instance is one light client of one chain. Every account is a PDA of the program. There is no
+signer: nobody is named in a transaction or in a statement.
+
+| Account | Holds | Written by |
+|---|---|---|
+| `instance` | `InstanceConfig`, 221 bytes: chain ID, genesis validators root, fork schedule, slot and epoch sizes, committee size, `genesis_time`, `seconds_per_slot`, checkpoint root | `init_instance`, once |
+| `store` | The tracked light-client store, `store_codec` v2, 403 bytes | `init_instance`, `finish_update` |
+| `records` | 16 header records of 145 bytes: slot, header root, block number, block hash, state root, receipts root | `init_instance`, `finish_update` |
+| `job` | One staged update, 641 bytes. One account per update, at the address derived from the instance and the update's digest | `begin_update` claims it, `miller_update`, `finish_update` empties it |
+| `statement` | One verified statement, at the address of its statement ID | `attest_state`, `attest_log` |
+
+The instance ID is `SHA-256("LE_SYNC_INSTANCE_V1" || config)`. Every other address is derived from
+it, and the program recomputes each seed, so an account of another instance is refused (318). No
+instruction edits `instance`, and no account holds a program ID.
+
+| Instruction | Does |
+|---|---|
+| `init_instance` | Writes the configuration. Starts the store from the checkpoint: the header must hash to the trusted root, and a branch must prove the committee's keys root and aggregate under its state root |
+| `begin_update` | Step 1. Claims the job of this update |
+| `miller_update` | Step 2 |
+| `finish_update` | Step 3. Moves the store, empties the job, and when the finalized header moved stores its record (execution header checked against the header's `body_root`) |
+| `attest_state` | Verifies an account or storage claim against a stored record. Claims the statement account |
+| `attest_log` | Verifies a log claim the same way |
+
+**Time.** `init_instance`, `begin_update` and `finish_update` take the 1-block LEZ clock account.
+The slot is `(timestamp_ms / 1000 - genesis_time) / seconds_per_slot`. No caller supplies it. Any
+other account in the clock's place is refused (321).
+
+**Records.** A full log replaces the record with the lowest slot, so an attestation can only be
+made against one of the latest 16 finalized headers (316 otherwise).
+
+**Statements.** The statement account's seed must be the statement ID of the verified claim (320
+otherwise), so the chain ID and block are part of its address. A predicate reads only what the
+claim's proof covers: an account claim the balance, a storage claim the balance and the slot value,
+a log claim its topics and data words. Anything else is 206. The statement holds what the proofs
+established and nothing about who asked.
+
+**Updates.** The three steps run in order (308). A job is bound to the update and to the store it
+was begun against (309, 310). An update that is not newer than the finalized header is refused
+(304). An update signed in the next period, before the instance knows that committee, is refused
+(317). A begun update that is never finished blocks nobody: the next update has its own job.
+
+### Build and test
+
+```sh
+logos-scaffold build        # guest, IDL (lez/idl) and client (lez/src/generated)
+sh scripts/check_lez_in_step.sh   # guest and host copy declare the same instructions
+
+cargo test --release --manifest-path lez/executor-tests/Cargo.toml
+cargo run  --release --manifest-path lez/executor-tests/Cargo.toml --bin gas [N]   # N default 512
+cargo test --release --manifest-path lez/executor-tests/Cargo.toml -- --ignored    # cap at 512
+```
+
+The executor tests run each instruction through LEZ's in-memory state machine (`V03State`) with
+real BLS-signed updates and proofs, one transaction after another, and check the program's error
+code on every refusal. They cover:
+
+- a fabricated chain with a self-consistent header and proof (400, and the honest update still goes
+  through);
+- a handoff from an unknown committee (317);
+- a signature below the threshold (501);
+- a valid proof against a header that is not finalized (316);
+- a tampered state root or receipts root (201) and a tampered proof (the native verifier's code);
+- a proof replayed on another chain ID (320);
+- a predicate over state the proof does not cover (206);
+- duplicate and out-of-order updates, and out-of-order steps (304, 308, 310);
+- the clock as the only source of time (302, 321, 500);
+- no instruction changes `instance`, and instances share no accounts;
+- the public statement holds the verified statement and nothing else.
+
+---
+
+## 4. Setup
 
 ```sh
 # optional: pick your own execution RPC (must serve eth_getProof and eth_getBlockReceipts).
@@ -240,7 +337,7 @@ independent sources before you rely on a result. Override any variable before so
 
 ---
 
-## 4. Run
+## 5. Run
 
 ### One command per task
 
@@ -364,6 +461,7 @@ cargo test -p le-sync-core                                 # 0 failures expected
 cargo test -p le-sync-wire
 cargo test -p le-sync-wire --features bls-zk,bls-blst --test staged_update --test rooted_update
 cargo test --manifest-path bench/Cargo.toml                # argument parsing and the report
+cargo test --release --manifest-path lez/executor-tests/Cargo.toml   # the LEZ program (section 3)
 RISC0_SKIP_BUILD=1 cargo test -p le-sync -p le-sync-wire   # host and wire, no guest build
 cargo test --workspace                                     # everything (builds the guest)
 
@@ -393,7 +491,7 @@ accept or reject, same error, same resulting store. `rooted_update` also covers 
 
 ---
 
-## 5. Flags
+## 6. Flags
 
 | Flag | Use |
 |---|---|
@@ -423,7 +521,7 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 
 ---
 
-## 6. If it fails
+## 7. If it fails
 
 | You see | Cause | Do |
 |---|---|---|
@@ -468,4 +566,4 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 | State: account proof | 568K |
 | State: storage proof | 453K |
 
-The staged steps in section 2 are the version of the sync part that fits the LEZ cap.
+The staged steps in sections 2 and 3 are the version of the sync part that fits the LEZ cap.

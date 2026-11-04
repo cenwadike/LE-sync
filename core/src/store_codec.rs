@@ -472,6 +472,56 @@ mod tests {
         }
     }
 
+    /// A v1 store with the given committee lengths and otherwise well-formed bytes, so that the
+    /// lengths are the only thing a decoder can object to.
+    fn v1_with_lengths(cur: usize, next: usize) -> Vec<u8> {
+        let mut b = enc(&busy_store())[..241].to_vec();
+        for n in [cur, next] {
+            b.extend_from_slice(&(n as u16).to_le_bytes());
+            b.extend(std::iter::repeat(0x77u8).take(n * 48));
+            b.extend_from_slice(&[0x88u8; 48]);
+        }
+        b
+    }
+
+    #[test]
+    fn decode_judges_each_committee_length_on_its_own() {
+        // the baseline: the real encoding is what this helper reproduces at length 32
+        assert_eq!(
+            v1_with_lengths(32, 32),
+            enc(&{
+                let mut s = busy_store();
+                for c in [&mut s.current_sync_committee, &mut s.next_sync_committee] {
+                    c.pubkeys.iter_mut().for_each(|k| *k = [0x77; 48]);
+                    c.aggregate_pubkey = [0x88; 48];
+                }
+                s
+            })
+        );
+        // equal and valid: accepted at any valid size
+        for n in [1usize, 2, 16, 32] {
+            let s = decode_store(&v1_with_lengths(n, n)).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+            assert_eq!(s.current_sync_committee.len, n);
+            assert_eq!(s.next_sync_committee.len, n);
+        }
+        // equal but invalid: the first committee has no `expect`, so only validity can refuse it
+        for n in [0usize, 3, 24, 33, 1024] {
+            assert_eq!(
+                decode_store(&v1_with_lengths(n, n)).err(),
+                Some(Error::StoreEncoding),
+                "both {n}"
+            );
+        }
+        // each valid but unequal: only the match against the first can refuse the second
+        for (cur, next) in [(32, 16), (16, 32), (1, 2), (2, 1)] {
+            assert_eq!(
+                decode_store(&v1_with_lengths(cur, next)).err(),
+                Some(Error::StoreEncoding),
+                "{cur} then {next}"
+            );
+        }
+    }
+
     #[test]
     fn decode_rejects_bad_or_unequal_committee_lengths() {
         let b = enc(&busy_store());

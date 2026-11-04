@@ -31,6 +31,8 @@
 #   le_cost [flags] execute-only cycles of the three staged update steps (Begin, Miller, Finish)
 #                   from bench/, against a mainnet-size committee. No network and no proving.
 #                   Flags go to the bench: --committee N, --scenario NAME, --cap CYCLES, --detail
+#   le_eth_attest   check that guest handler accounts/arguments match the host IDL stub
+#
 #   le              raw host CLI (any flags)
 # After le_verify these shell variables hold the results:
 #   BLOCK  G_BALANCE G_VALUE (from the guest)  I_BALANCE I_VALUE (from the RPC)
@@ -405,6 +407,15 @@ le_prove() {
   printf '%s\n' "$R" >"$dir/trusted_root"
   le_verify_receipt "$out" "$kind" "$@" || return 1
   echo "prove: PASS ($out)"
+}
+
+# ---- Attestation check command ----------------------------------------------------------------
+
+# Check guest handler declarations against the host IDL stub. Handler bodies are guest-only.
+le_eth_attest() {
+  local script_dir
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return
+  "$script_dir/check_lez_in_step.sh"
 }
 
 # ---- setup check ------------------------------------------------------------------------------

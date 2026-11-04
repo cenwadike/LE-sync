@@ -157,7 +157,7 @@ fn period_update_without_a_proven_handoff_is_rejected() {
     let c3 = tk::committee(3, N);
     let (_, bb) = handoff_pair(&b, &b.next, &b.next, &c3);
     let t = run(&b.input_with(vec![bb]));
-    assert_eq!(only(&t), rejected(Error::PeriodSkipped));
+    assert_eq!(only(&t), rejected(Error::HandoffNotVerified));
     assert_eq!(t.output.finalized_slot, 8);
 }
 

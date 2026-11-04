@@ -8,6 +8,7 @@
 pub mod bls;
 pub mod rooted;
 pub mod stage;
+pub mod statement_path;
 
 use le_sync_core::exec::{anchor_execution, verify_execution_anchor, ExecutionPayloadHeader};
 use le_sync_core::keccak::keccak256;

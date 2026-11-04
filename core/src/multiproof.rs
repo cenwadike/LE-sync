@@ -298,6 +298,47 @@ mod tests {
         assert!(!ok(&many, &ls, 8));
     }
 
+    /// Every check in the guard must refuse on its own: each case here carries a proof that is
+    /// honest for the tree it was built from, so only the guard under test can reject it.
+    #[test]
+    fn each_size_and_count_guard_refuses_on_its_own() {
+        let verify = |n_claimed: usize, n_built: usize, index: &[u16], leaves: &[Bytes32]| {
+            let t = tree(n_built);
+            verify_multiproof(
+                &t[1],
+                n_claimed,
+                index,
+                leaves,
+                prove(n_built, index).into_iter(),
+            )
+        };
+        let l = |i: usize| leaf(i);
+        // the honest baseline for each shape used below
+        assert!(verify(8, 8, &[1], &[l(1)]));
+        assert!(verify(512, 512, &[1], &[l(1)]));
+        // not a power of two: a real tree of the next size up, and of the next size down
+        for n in [3usize, 5, 6, 7, 12, 100, 500] {
+            let up = n.next_power_of_two();
+            assert!(!verify(n, up, &[0], &[l(0)]), "n={n} over {up}");
+            assert!(!verify(n, up / 2, &[0], &[l(0)]), "n={n} over {}", up / 2);
+        }
+        // a power of two above the cap, with an honest proof for its own tree
+        for n in [1024usize, 2048] {
+            assert!(!verify(n, n, &[0], &[l(0)]), "n={n}");
+            assert!(!verify(n, n, &[1, 2], &[l(1), l(2)]), "n={n}");
+        }
+        // zero
+        assert!(!verify(0, 1, &[], &[]));
+        // one more leaf than indexes, or one fewer, with the proof of the indexes
+        assert!(!verify(8, 8, &[1], &[l(1), l(2)]));
+        assert!(!verify(8, 8, &[1, 2], &[l(1)]));
+        assert!(!verify(8, 8, &[], &[l(1)]));
+        // every leaf of the tree at once is fine: the count may equal `n`
+        let all: Vec<u16> = (0..8).collect();
+        let ls: Vec<Bytes32> = (0..8).map(l).collect();
+        assert!(verify(8, 8, &all, &ls));
+    }
+
     #[test]
     fn a_single_leaf_tree_is_its_own_root() {
         let root = leaf(0);

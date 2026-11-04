@@ -1,0 +1,31 @@
+[package]
+name = "le-sync-executor-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Sprint 6 M2: runs each instruction of the eth_attest LEZ program through LEZ's in-memory state machine, with real signed updates, and prints gas per instruction"
+
+# Own workspace, like ../../bench: `bls-blst` pulls in the risc0 fork of `blst`
+# (`links = "blst"`), which must not meet the host crates of the root workspace. Listed in the
+# root `exclude`. Build and run it through `--manifest-path lez/executor-tests/Cargo.toml`.
+[workspace]
+
+[dependencies]
+le-sync-core = { path = "../../core" }
+# `bls-blst` for the host-side hints (`uncompress_g1`) and the statement types.
+le-sync-wire = { path = "../../wire", features = ["bls-blst"] }
+# Seeded committees, a real BLS signer, BeaconState-shaped trees and tries.
+le-sync-testkit = { path = "../../testkit" }
+
+# LEZ v0.1.2, the same tag as the program and the scaffold pin (cf3639d).
+nssa = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.1.2" }
+nssa_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.1.2" }
+# `compute_pda`, as the generated client uses it.
+spel-framework-core = { git = "https://github.com/logos-co/spel.git", rev = "73fc462eb8f0a4d00f1a846437c627ec2e523f83" }
+
+# The built program: `ETH_ATTEST_ELF`, from `lez/methods` (risc0-build compiles the guest).
+example_program_deployment_methods = { path = "../methods" }
+
+risc0-zkvm = { version = "=3.0.5", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

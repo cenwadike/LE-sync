@@ -2,20 +2,38 @@
 name = "example_program_deployment_programs"
 version = "0.1.0"
 edition = "2024"
-license = { workspace = true }
+license = "MIT or Apache-2.0"
+
+# Own workspace, as in `guest-stage`: this package is built for riscv32im-risc0-zkvm-elf by
+# risc0-build (methods/build.rs), and it needs the RISC Zero sha2 fork and the blst fork below,
+# which must not apply to the host crates of the root workspace (see `exclude` there).
+[workspace]
 
 [dependencies]
-nssa_core.workspace = true
-hex.workspace = true
-bytemuck.workspace = true
-risc0-zkvm.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-borsh.workspace = true
-spel-framework.workspace = true
-spel-framework-core.workspace = true
+nssa_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.1.2" }
+clock_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.1.2" }
+spel-framework = { git = "https://github.com/logos-co/spel.git", rev = "73fc462eb8f0a4d00f1a846437c627ec2e523f83" }
+spel-framework-core = { git = "https://github.com/logos-co/spel.git", rev = "73fc462eb8f0a4d00f1a846437c627ec2e523f83" }
+risc0-zkvm = { version = "3.0.5", default-features = false, features = ["std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+# The light client. `bls-blst` is the staged backend (raw Miller access); the same crates and
+# features the measured guests (`guest-stage`) use.
+le-sync-core = { path = "../../../core" }
+le-sync-wire = { path = "../../../wire", features = ["bls-blst"] }
+# Pinned so that the [patch] below applies (the patch is for exactly this version).
+sha2 = { version = "=0.10.8", default-features = false }
+
+# Accelerated SHA-256 (same tag as ../../../guest-stage).
+[patch.crates-io]
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.8-risczero.0" }
+
+# nssa_core v0.1.2 enables RISC Zero's default host client/Bonsai features for the
+# guest too. Use the local manifest-only feature correction for this guest workspace.
+[patch."https://github.com/logos-blockchain/logos-execution-zone.git"]
+nssa_core = { path = "../../patches/nssa-core" }
 
 [[bin]]
-name = "lez_counter"
-path = "src/bin/lez_counter.rs"
+name = "eth_attest"
+path = "src/bin/eth_attest.rs"
 test = false
