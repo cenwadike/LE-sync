@@ -1,0 +1,41 @@
+# Local run: a standalone LEZ sequencer on this machine, real Ethereum mainnet data.
+# Values marked FILL are written by scripts/deploy.sh or must be set once by hand.
+
+[env]
+name = "local"
+
+[lez]
+sequencer_url = "http://127.0.0.1:3040"   # CONFIRM: the address your local sequencer listens on
+account = "Public/GBHVS7eh1bfuXwY8BasBZACvF9Ehhy3JfzezAmxzCiL"
+lez_dir = "lez"                         # the scaffold project (where `lgs build` runs)
+program_id = "e1e45dd91cb8ab5c9ae463fe6e113f4cc0dd47941d4750e4025b622613036ed3"   # written by deploy.sh
+instance_id = "0xfd7ab4bee6253199ed38e03135c3b36d49b946f7935474c33bef5f2492179775"   # written by deploy.sh
+
+[eth]
+network = "mainnet"
+chain_id = 1
+source = "live"                           # live | replay
+beacon_url = "https://lodestar-mainnet.chainsafe.io"
+beacon_url_2 = "https://ethereum-beacon-api.publicnode.com" # independent finalized-root check
+execution_url = "https://ethereum-rpc.publicnode.com"
+replay_url = "http://127.0.0.1:5052"      # scripts/replay_server.sh, used when source = "replay"
+
+[instance]
+slots_per_epoch = 32
+epochs_per_period = 256
+sync_committee_size = 512
+genesis_time = "1606824023"   # written by deploy.sh from the beacon API (verify it, see docs)
+genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"   # written by deploy.sh
+seconds_per_slot = "12"   # written by deploy.sh
+electra_fork_epoch = "364032"   # written by deploy.sh
+forks = "electra:364032:0x05000000,fulu:411392:0x06000000"   # written by deploy.sh: "electra:<epoch>:<version>,fulu:<epoch>:<version>"
+trusted_root = "0x1fa42994cbebbfdb8e6b476fb9841b0774729cc9b290db1c162281a7cd3b3fcb"   # written by deploy.sh: the finalized root at deploy time; another root is another instance
+
+[fixtures]
+address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"   # WETH9 on Ethereum mainnet
+storage_slots = "0x0000000000000000000000000000000000000000000000000000000000000002"
+log_topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"   # ERC-20 Transfer
+
+[submitter]
+poll_seconds = 12                         # how often the background submitter looks
+defer_ms_max = 6000                       # holds back up to this long, a different time per operator, then looks again

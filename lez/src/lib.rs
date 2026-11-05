@@ -31,7 +31,8 @@ pub mod runner_support {
             embedded_elf.to_vec()
         };
 
-        Program::new(bytes).unwrap_or_else(|err| panic!("failed to parse {label} program: {err}"))
+        Program::new(bytes.into())
+            .unwrap_or_else(|err| panic!("failed to parse {label} program: {err}"))
     }
 }
 
@@ -125,6 +126,7 @@ mod eth_attest {
     /// Attests an account or a storage slot under the record of `header_root`. `claim` is the
     /// RISC Zero serde words of an `AttestClaim::Account` or `::Storage`; `statement_seed` must
     /// be the statement ID of the verified claim, and the statement account is claimed here.
+    #[allow(unused_variables)]
     #[instruction]
     pub fn attest_state(
         #[account(pda = arg("instance_id"))] instance: AccountWithMetadata,
@@ -140,11 +142,12 @@ mod eth_attest {
     }
 
     /// Attests a log. As `attest_state`, with an `AttestClaim::Log`.
+    #[allow(unused_variables)]
     #[instruction]
     pub fn attest_log(
         #[account(pda = arg("instance_id"))] instance: AccountWithMetadata,
         #[account(pda = arg("records_seed"))] records: AccountWithMetadata,
-        #[account(init, pda = arg("statement_seed"))] mut statement: AccountWithMetadata,
+        #[account(init, pda = arg("statement_seed"))] statement: AccountWithMetadata,
         instance_id: [u8; 32],
         records_seed: [u8; 32],
         statement_seed: [u8; 32],

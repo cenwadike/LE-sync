@@ -1,0 +1,16 @@
+module eth_attest_module {
+    version "0.1.0"
+    description "Trustless Ethereum state attestation for LEZ"
+
+    method configure(config_path: string) -> string
+    method start() -> string
+    method stop() -> string
+    method status() -> string
+    method read_instance() -> string
+    method submit_update() -> string
+    method attest_state(address: string, slot: string) -> string
+    method attest_log(address: string, topic0: string) -> string
+
+    event update_submitted(finalized_slot: string)
+    event update_failed(reason: string)
+}

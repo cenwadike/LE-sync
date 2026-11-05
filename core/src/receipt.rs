@@ -16,9 +16,10 @@
 //! Semantic failures are `Error::LogMismatch` (205): a failed transaction (status 0), a log
 //! index beyond the receipt's logs, or a log that does not match the requested filter.
 //!
-//! Supported types: legacy, `0x01` (EIP-2930) and `0x02` (EIP-1559). Types `0x03` (EIP-4844)
-//! and `0x04` (EIP-7702) are refused until their receipt payload is confirmed against the
-//! EIPs; a transaction of those types fails closed.
+//! Supported types: legacy, `0x01` (EIP-2930), `0x02` (EIP-1559), `0x03` (EIP-4844), and
+//! `0x04` (EIP-7702). These typed transaction envelopes use the same EIP-658 receipt payload;
+//! the transaction type byte prefixes the payload in the receipts trie. Unknown types fail
+//! closed.
 //!
 //! Spec: EIP-2718 (envelope and trie placement), EIP-658 (status), Yellow Paper (receipt, log).
 
@@ -29,8 +30,8 @@ use crate::{Bytes32, Error};
 /// A log carries at most four topics (`LOG0`..`LOG4`).
 pub const MAX_TOPICS: usize = 4;
 
-/// Typed receipt envelopes this parser accepts. See the module note on `0x03` and `0x04`.
-const SUPPORTED_TYPES: [u8; 2] = [0x01, 0x02];
+/// Typed receipt envelopes this parser accepts.
+const SUPPORTED_TYPES: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
 
 /// One decoded log. `topics[..topic_count]` are valid; the rest are zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +236,8 @@ mod tests {
         let legacy = receipt(&logs);
         let t1 = typed(0x01, receipt(&logs));
         let t2 = typed(0x02, receipt(&logs));
+        let t3 = typed(0x03, receipt(&logs));
+        let t4 = typed(0x04, receipt(&logs));
         let want = parsed(&legacy, 0).unwrap();
         assert_eq!(want.address, ADDR);
         assert_eq!(want.topic_count, 2);
@@ -244,6 +247,8 @@ mod tests {
         assert_eq!(want.data, &[1u8; 40][..]);
         assert_eq!(parsed(&t1, 0), Ok(want));
         assert_eq!(parsed(&t2, 0), Ok(want));
+        assert_eq!(parsed(&t3, 0), Ok(want));
+        assert_eq!(parsed(&t4, 0), Ok(want));
     }
 
     #[test]
@@ -276,8 +281,8 @@ mod tests {
     #[test]
     fn unknown_unsupported_and_misplaced_type_bytes_are_rejected() {
         let body = receipt(&[good_log(1)]);
-        // 0x00 is reserved, 0x03 and 0x04 are not yet supported, the rest are unknown
-        for t in [0x00u8, 0x03, 0x04, 0x05, 0x10, 0x7f] {
+        // 0x00 is reserved; the rest are unknown
+        for t in [0x00u8, 0x05, 0x10, 0x7f] {
             assert_eq!(
                 parsed(&typed(t, body.clone()), 0),
                 Err(Error::InvalidRlp),

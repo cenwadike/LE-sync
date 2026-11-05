@@ -200,8 +200,8 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = self.wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = self.wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -209,7 +209,7 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let response = self.wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let response = self.wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         Ok(hex::encode(response.0))
     }
@@ -240,8 +240,8 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = self.wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = self.wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -249,7 +249,7 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let response = self.wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let response = self.wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         Ok(hex::encode(response.0))
     }
@@ -271,8 +271,8 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = self.wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = self.wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -280,7 +280,7 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let response = self.wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let response = self.wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         Ok(hex::encode(response.0))
     }
@@ -318,8 +318,8 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = self.wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = self.wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -327,7 +327,7 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let response = self.wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let response = self.wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         Ok(hex::encode(response.0))
     }
@@ -359,8 +359,8 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = self.wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = self.wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -368,7 +368,7 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let response = self.wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let response = self.wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         Ok(hex::encode(response.0))
     }
@@ -400,8 +400,8 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = self.wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = self.wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -409,7 +409,7 @@ impl<'w> EthAttestClient<'w> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let response = self.wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let response = self.wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         Ok(hex::encode(response.0))
     }

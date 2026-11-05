@@ -7,7 +7,7 @@
 //! minimum participation: the largest update, and the one that merkleizes a committee).
 use crate::harness::{Chain, Ids, CYCLE_CAP};
 use crate::world::{clock_ms, min_participants, Spec, World, ADDR, LOG_TX, SLOT_A};
-use example_program_deployment_methods::ETH_ATTEST_ELF;
+use execute_attestation_deployment_methods::ETH_ATTEST_ELF;
 
 pub struct Row {
     pub name: String,

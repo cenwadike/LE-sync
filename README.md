@@ -1,33 +1,103 @@
 # le-sync: Logos-Ethereum Synchronizer (RFP-021 PoC)
 
-Prove an Ethereum account balance, storage value or event log inside a RISC Zero guest, starting
-from one trusted checkpoint, and save the result as a verifiable receipt. Nothing the beacon API
-or the execution RPC says is trusted.
+Verify Ethereum finality and attest account or storage state on Logos Execution Zone (LEZ).
+`le-sync` combines a Rust light-client verifier, a staged LEZ program, and host-side tools that
+fetch Ethereum data and submit verified updates. Beacon and execution RPCs are data sources, not
+trust anchors.
 
-The same light-client logic also runs on LEZ as the `eth_attest` program: an update in three small
-steps (Begin, Miller, Finish) that each fit the per-transaction cycle cap, and attestations of
-accounts, storage slots and logs against the stored headers. Sections 2 and 3 describe it.
+The repository also contains a RISC Zero guest and CLI for producing independently verifiable
+receipts. The on-chain program is `eth_attest`; each instance tracks a chain from a configured
+weak-subjectivity checkpoint and keeps a bounded set of finalized execution headers.
+
+> **Current status:** the local live flow for account and storage attestations, negative cases,
+> submitter races, and recovery has passed against a local LEZ sequencer using Ethereum mainnet
+> data. The LEZ program verifies account, storage, and log claims; the `module/ops` CLI implements
+> all three. Log attestations select the first successful log matching an emitting address and
+> `topic0` in the newest finalized execution block. The e2e runner now exercises that path when
+> the configured event occurs in the newest finalized block. A public LEZ testnet release is not
+> implied by the local run.
+
+For example, after configuring the operator environment and initializing/updating an instance:
+
+```sh
+eth_attest_ops --config config/local.toml attest-log \
+  --address 0xYOUR_CONTRACT_ADDRESS --topic0 0xYOUR_EVENT_SIGNATURE_HASH
+```
+
+The operator fetches `eth_getBlockReceipts`, rebuilds the receipts trie, checks it against the
+finalized header record, and submits the receipt proof to `attest_log`. The RPC must support
+`eth_getBlockReceipts`.
+
+## Quick start
+
+The end-to-end runner builds and tests the operator CLI, deploys a fresh local instance, then
+exercises updates, attestations, negative cases, races, and recovery. It submits transactions to
+the configured sequencer.
+
+```sh
+scripts/run.sh local live
+```
+
+Prerequisites include Rust, `lgs`, a running local LEZ sequencer, and a funded wallet account
+configured in `config/local.toml`. The script saves the run's config copy and logs under `.run/`.
+Use `scripts/run.sh --help` for modes and options. `live` uses the configured Beacon and execution
+endpoints; `replay` uses recorded fixtures and requires `jq` and `socat`.
+
+## Architecture
+
+### Trust and verification path
+
+```mermaid
+flowchart TD
+    A["Trusted checkpoint<br/>weak-subjectivity root"] --> B["Bootstrap header +<br/>sync committee branch"]
+    B --> C["Sync committee update<br/>BLS signature + finality"]
+    C --> D["Finalized Beacon header"]
+    D --> E["Execution payload header<br/>branch under body_root"]
+    E --> F["Execution state_root"]
+    F --> G["Account trie proof"]
+    G --> H["Balance or verified storageRoot"]
+    H --> I["Storage trie proof"]
+    E --> J["Execution receipts_root"]
+    J --> K["Receipt proof"]
+    K --> L["Log claim"]
+    G --> M["Verified statement<br/>deterministic ID"]
+    I --> M
+    L --> M
+```
+
+The trusted root is supplied at instance initialization. After that, update validity, finality,
+committee transitions, execution-header anchoring, and account/storage/log inclusion are checked
+by the program. RPCs can delay or withhold data, but cannot make an invalid proof pass.
+
+### Update and attestation flow
+
+```mermaid
+sequenceDiagram
+    participant O as Operator / module
+    participant E as Ethereum Beacon + execution APIs
+    participant P as eth_attest program on LEZ
+    participant C as Consumer
+    O->>E: Fetch light-client update and execution data
+    O->>P: begin_update (validated data, job account)
+    O->>P: miller_update (pairing intermediate state)
+    O->>P: finish_update (verify signature, advance store)
+    P-->>O: Store finalized header record
+    C->>E: Obtain account, storage, or receipt proof
+    C->>P: attest_state / attest_log with record root and claim
+    P-->>C: Statement account at deterministic statement ID
+    C->>C: Apply consumer-owned nullifier and application action
+```
+
+The program does not enforce who submits updates. Operators are relayers: the program verifies
+updates and claims rather than trusting their identity. A background submitter exists in the Rust
+module and starts only when its `start` method is called; the one-shot CLI and end-to-end script
+do not start it as a persistent service.
+
+The submitter also checks the update's `signature_slot` against the LEZ clock before beginning.
+If the Beacon API is ahead, it reports `waiting_for_signature_slot` and retries on the next poll
+rather than treating a valid, not-yet-usable update as a slot-order failure.
 
 ---
-
-## 1. Design
-
-### Chain of trust
-
-```
-trusted block root (you, weak subjectivity)
-  └─ bootstrap header + current sync committee          (branch, gindex 86)
-      └─ sync-committee BLS signature on attested header (2/3 gate)
-          └─ finalized beacon header                    (finality branch, gindex 169)
-              └─ ExecutionPayloadHeader                 (execution_branch, gindex 25)
-                  ├─ state_root
-                  │   └─ account  (MPT proof)  → balance, storageRoot
-                  │       └─ slot (MPT proof)  → value
-                  └─ receipts_root
-                      └─ receipt  (MPT proof, key rlp(tx index)) → log (address, topics, data)
-```
-
-Every arrow is checked in the guest. The host only fetches data.
 
 ### Crates
 
@@ -42,6 +112,9 @@ Every arrow is checked in the guest. The host only fetches data.
 | `lez` | The `eth_attest` LEZ program (`methods/guest`), its host copy for the IDL (`src/lib.rs`), and `executor-tests` (own workspace) |
 | `testkit` | Test-only reference trie, seeded committees, BLS signer and fixtures |
 | `vectors` | Replays the consensus-spec-tests against `core` |
+| `module/ops` | Ethereum source, update planning, submitter, CLI, and background worker |
+| `module/rust-lib` | Logos module provider that delegates methods to `module/ops` |
+| `scripts` | Local deployment, e2e, fixture recording, and replay helpers |
 
 ### What the guest checks (state section)
 
@@ -147,8 +220,8 @@ Ranges: 1xx config, 2xx bootstrap, branches and proofs, 3xx update validity, 4xx
 ### Limits
 
 - Electra and Fulu only. Other forks fail closed.
-- Receipt types: legacy, `0x01`, `0x02`. Types `0x03` and `0x04` fail closed until their receipt
-  payload is confirmed.
+- Receipt types: legacy and typed `0x01` through `0x04` (EIP-2930, EIP-1559, EIP-4844,
+  EIP-7702). Unknown types fail closed.
 - Native ETH transfers are not covered: the beacon header's `transactions_root` is an SSZ root, not
   an MPT root.
 - The log needs an RPC that serves `eth_getBlockReceipts`. The host rebuilds the receipts trie and
@@ -158,7 +231,7 @@ Ranges: 1xx config, 2xx bootstrap, branches and proofs, 3xx update validity, 4xx
 
 ---
 
-## 2. Staged update (Sprint 6)
+## Staged update
 
 LEZ stops a program at 32 MiB cycles (`33,554,432`, LEZ v0.1.2 public execution). One signature
 check costs more, so the update is split into three transactions:
@@ -246,7 +319,7 @@ Run the bench from its own manifest: it is its own workspace because `bls-blst` 
 
 ---
 
-## 3. LEZ program (`eth_attest`)
+## LEZ program (`eth_attest`)
 
 One instance is one light client of one chain. Every account is a PDA of the program. There is no
 signer: nobody is named in a transaction or in a statement.
@@ -320,7 +393,7 @@ code on every refusal. They cover:
 
 ---
 
-## 4. Setup
+## Setup
 
 ```sh
 # optional: pick your own execution RPC (must serve eth_getProof and eth_getBlockReceipts).
@@ -337,7 +410,7 @@ independent sources before you rely on a result. Override any variable before so
 
 ---
 
-## 5. Run
+## Run
 
 ### One command per task
 
@@ -491,7 +564,7 @@ accept or reject, same error, same resulting store. `rooted_update` also covers 
 
 ---
 
-## 6. Flags
+## Flags
 
 | Flag | Use |
 |---|---|
@@ -521,7 +594,7 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 
 ---
 
-## 7. If it fails
+## If it fails
 
 | You see | Cause | Do |
 |---|---|---|
@@ -540,30 +613,3 @@ Exit codes: `0` OK, `1` failed, `2` usage error, `3` chain mismatch.
 | `cost: FAIL (bench exit 101)` with `can't find bin` | A file named in `guest-stage/Cargo.toml` is missing | Check `ls guest-stage/src` against the `[[bin]]` paths |
 | `cost: FAIL` with `MISMATCH` | The guest and the native run disagree | Report the step and both results |
 | `cost: FAIL` with `a step is over the cap` | A step exceeds `--cap` | Read the table: which step, and how far |
-
----
-
-## Verified runs
-
-### Mainnet, 2026-10-24
-
-| Item | Value |
-|---|---|
-| Account | WETH9, `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` |
-| Finalized slot / block | 15501952 / 26262717 |
-| Balance | `0x1d939a6235e9dff0524d5` wei, equals `eth_getBalance` at that block |
-| Slot `0x0` | `0x5772617070656420457468657200...1a` ("Wrapped Ether"), equals `eth_getStorageAt` |
-| Tamper runs | 201 and 204, as expected |
-
-### Cycles, single-shot guest (execute only)
-
-| Part | Cycles |
-|---|---|
-| Whole guest | 65.7M |
-| Read input | 9.0M |
-| Sync (mostly BLS) | 54.3M |
-| State: anchor | 50K |
-| State: account proof | 568K |
-| State: storage proof | 453K |
-
-The staged steps in sections 2 and 3 are the version of the sync part that fits the LEZ cap.

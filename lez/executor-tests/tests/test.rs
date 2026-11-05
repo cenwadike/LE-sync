@@ -1,4 +1,4 @@
-//! M2 executor tests: every instruction of `eth_attest` through LEZ's in-memory state machine,
+//! program executor tests: every instruction of `eth_attest` through LEZ's in-memory state machine,
 //! with real signed updates. One test per named case of the milestone, then the protocol
 //! (duplicate and out-of-order updates), the absence of any instruction that edits the
 //! configuration, instance isolation, and the public statement.
@@ -11,14 +11,16 @@
 //! (a tampered proof), the native verifier is the oracle.
 use std::sync::{Mutex, OnceLock};
 
-use example_program_deployment_methods::ETH_ATTEST_ELF;
+use execute_attestation_deployment_methods::ETH_ATTEST_ELF;
 use le_sync_core::header_record::{find_record, RECORD_LEN};
 use le_sync_core::instance::{Bootstrap, InstanceConfig};
 use le_sync_core::store_codec::decode_store;
 use le_sync_core::Bytes32;
 use le_sync_executor_tests::harness::*;
 use le_sync_executor_tests::world::*;
-use le_sync_wire::statement_path::{verify_attest, AccountClaim, AttestClaim, StorageClaim, Verified};
+use le_sync_wire::statement_path::{
+    verify_attest, AccountClaim, AttestClaim, StorageClaim, Verified,
+};
 use le_sync_wire::{PredicateOp, PredicateTarget, PredicateWire};
 use nssa::{AccountId, CLOCK_01_PROGRAM_ACCOUNT_ID, CLOCK_10_PROGRAM_ACCOUNT_ID};
 
@@ -152,7 +154,8 @@ fn init_instance_refuses_a_bad_bootstrap_and_changes_nothing() {
     let mut c = c0.clone();
     let mut boot = i.w.bootstrap();
     boot.header.proposer_index += 1;
-    c.init(&i.ids, &i.cfg, &boot).expect_code(200, "wrong checkpoint");
+    c.init(&i.ids, &i.cfg, &boot)
+        .expect_code(200, "wrong checkpoint");
     assert!(unowned(&c));
 
     // a branch that does not prove the committee
@@ -182,11 +185,21 @@ fn the_slot_is_read_from_the_clock_account_and_nothing_else() {
     let c0 = new_chain();
     let i = inst(&c0, 1, 1);
     let mut c = c0.clone();
-    c.init_with_clock(&i.ids, &i.cfg, &i.w.bootstrap(), CLOCK_10_PROGRAM_ACCOUNT_ID)
-        .expect_code(321, "the 10-block clock");
+    c.init_with_clock(
+        &i.ids,
+        &i.cfg,
+        &i.w.bootstrap(),
+        CLOCK_10_PROGRAM_ACCOUNT_ID,
+    )
+    .expect_code(321, "the 10-block clock");
     let mut c = c0.clone();
-    c.init_with_clock(&i.ids, &i.cfg, &i.w.bootstrap(), pda(&c0.program_id(), &[4; 32]))
-        .expect_code(321, "an account that is not a clock");
+    c.init_with_clock(
+        &i.ids,
+        &i.cfg,
+        &i.w.bootstrap(),
+        pda(&c0.program_id(), &[4; 32]),
+    )
+    .expect_code(321, "an account that is not a clock");
 
     // a clock far past the checkpoint makes the checkpoint stale: there is no argument that
     // could say otherwise
@@ -200,7 +213,8 @@ fn the_slot_is_read_from_the_clock_account_and_nothing_else() {
     c.set_clock(clock_ms(30));
     let u = i.w.update(&Spec::new(N));
     let job = c.job_for(&i.ids, &i.cfg, &u);
-    c.begin(&i.ids, &job, &u).expect_code(302, "an update from the future");
+    c.begin(&i.ids, &job, &u)
+        .expect_code(302, "an update from the future");
 
     // and the same update at slot 41 is accepted
     let mut c = fresh();
@@ -220,7 +234,10 @@ fn a_valid_update_moves_the_store_and_stores_the_record_of_the_finalized_header(
     let rec = find_record(&s.chain.data(i.ids.records), &u.finalized_root).expect("a record");
     assert_eq!(rec, u.record);
     assert_eq!(s.chain.data(i.ids.instance), i.cfg.encode().to_vec());
-    assert!(s.chain.data(s.job.account).is_empty(), "finish empties the job");
+    assert!(
+        s.chain.data(s.job.account).is_empty(),
+        "finish empties the job"
+    );
     assert_eq!(s.chain.owner(s.job.account), s.chain.program_id());
 }
 
@@ -277,7 +294,8 @@ fn a_handoff_from_a_committee_the_instance_does_not_know_is_its_own_error() {
     });
     let before = snap(&c, &i.ids);
     let job = c.job_for(&i.ids, &i.cfg, &u);
-    c.begin(&i.ids, &job, &u).expect_code(317, "handoff from an unknown committee");
+    c.begin(&i.ids, &job, &u)
+        .expect_code(317, "handoff from an unknown committee");
     assert_eq!(snap(&c, &i.ids), before);
 }
 
@@ -290,7 +308,8 @@ fn a_signature_below_the_threshold_is_refused_before_any_bls_work() {
         ..Spec::new(N)
     });
     let job = c.job_for(&i.ids, &i.cfg, &below);
-    c.begin(&i.ids, &job, &below).expect_code(501, "21 of 32 sign");
+    c.begin(&i.ids, &job, &below)
+        .expect_code(501, "21 of 32 sign");
 
     // one more signer and the same update is begun
     let at = i.w.update(&Spec {
@@ -331,10 +350,12 @@ fn a_tampered_execution_header_is_refused_and_the_staged_update_survives_it() {
     // a state root, then a receipts root, that the finalized header does not commit to
     let mut bad = i.w.update(&Spec::new(N));
     bad.exec.state_root[0] ^= 1;
-    c.finish(&i.ids, &job, &bad).expect_code(201, "a tampered state root");
+    c.finish(&i.ids, &job, &bad)
+        .expect_code(201, "a tampered state root");
     let mut bad = i.w.update(&Spec::new(N));
     bad.exec.receipts_root[0] ^= 1;
-    c.finish(&i.ids, &job, &bad).expect_code(201, "a tampered receipts root");
+    c.finish(&i.ids, &job, &bad)
+        .expect_code(201, "a tampered receipts root");
     assert_eq!(snap(&c, &i.ids), before, "nothing was stored");
 
     // the job is intact: the honest finish still goes through
@@ -417,7 +438,11 @@ fn a_predicate_over_state_the_proof_does_not_cover_is_refused() {
     // an account claim covers the balance, not a storage slot
     let claim = AttestClaim::Account(AccountClaim {
         address: ADDR,
-        account_proof: i.w.exec.state.prove(&le_sync_core::state::account_key(&ADDR)),
+        account_proof: i
+            .w
+            .exec
+            .state
+            .prove(&le_sync_core::state::account_key(&ADDR)),
         predicate: Some(p(PredicateTarget::StorageValue)),
     });
     s.chain
@@ -428,8 +453,16 @@ fn a_predicate_over_state_the_proof_does_not_cover_is_refused() {
     let claim = AttestClaim::Storage(StorageClaim {
         address: ADDR,
         slot: SLOT_A,
-        account_proof: i.w.exec.state.prove(&le_sync_core::state::account_key(&ADDR)),
-        storage_proof: i.w.exec.storage.prove(&le_sync_core::state::storage_key(&SLOT_A)),
+        account_proof: i
+            .w
+            .exec
+            .state
+            .prove(&le_sync_core::state::account_key(&ADDR)),
+        storage_proof: i
+            .w
+            .exec
+            .storage
+            .prove(&le_sync_core::state::storage_key(&SLOT_A)),
         predicate: Some(p(PredicateTarget::Topic(0))),
     });
     s.chain
@@ -461,7 +494,9 @@ fn a_duplicate_update_and_an_older_update_are_refused() {
         ..Spec::new(N)
     });
     let job = s.chain.job_for(&i.ids, &i.cfg, &older);
-    s.chain.begin(&i.ids, &job, &older).expect_code(304, "an older update");
+    s.chain
+        .begin(&i.ids, &job, &older)
+        .expect_code(304, "an older update");
 }
 
 #[test]
@@ -473,13 +508,15 @@ fn the_three_steps_run_in_order_or_not_at_all() {
 
     // Miller or Finish with no job
     c.miller(&job).expect_refused("miller before begin");
-    c.finish(&i.ids, &job, &u).expect_refused("finish before begin");
+    c.finish(&i.ids, &job, &u)
+        .expect_refused("finish before begin");
 
     c.begin(&i.ids, &job, &u).expect_ok("begin");
     // the same update cannot be begun again: its job is already claimed
     c.begin(&i.ids, &job, &u).expect_refused("begin twice");
     // Finish before Miller
-    c.finish(&i.ids, &job, &u).expect_code(308, "finish before miller");
+    c.finish(&i.ids, &job, &u)
+        .expect_code(308, "finish before miller");
 
     c.miller(&job).expect_ok("miller");
     c.miller(&job).expect_code(308, "miller twice");
@@ -505,12 +542,14 @@ fn an_update_begun_against_a_store_that_has_since_moved_cannot_finish() {
     assert_ne!(ja.account, jb.account, "one job account per update");
     c.begin(&i.ids, &ja, &a).expect_ok("begin a");
     c.miller(&ja).expect_ok("miller a");
-    c.begin(&i.ids, &jb, &b).expect_ok("begin b, while a is staged");
+    c.begin(&i.ids, &jb, &b)
+        .expect_ok("begin b, while a is staged");
     c.miller(&jb).expect_ok("miller b");
     c.finish(&i.ids, &jb, &b).expect_ok("finish b");
     // a was begun against the store before b
     let before = snap(&c, &i.ids);
-    c.finish(&i.ids, &ja, &a).expect_code(310, "finish a after b");
+    c.finish(&i.ids, &ja, &a)
+        .expect_code(310, "finish a after b");
     assert_eq!(snap(&c, &i.ids), before);
     let store = decode_store(&c.data(i.ids.store)).unwrap();
     assert_eq!(store.finalized_header.slot, 32);
@@ -547,8 +586,10 @@ fn no_instruction_changes_the_instance_account() {
     // init_instance cannot rewrite it either, whatever it is given
     let other = i.w.config(2);
     let other_ids = Ids::new(&c.program_id(), other.id());
-    c.init(&i.ids, &other, &i.w.bootstrap()).expect_refused("init with another configuration");
-    c.init(&i.ids, &i.cfg, &i.w.bootstrap()).expect_refused("init again");
+    c.init(&i.ids, &other, &i.w.bootstrap())
+        .expect_refused("init with another configuration");
+    c.init(&i.ids, &i.cfg, &i.w.bootstrap())
+        .expect_refused("init again");
     assert_eq!(account(&c), baseline, "init_instance");
     assert_ne!(other_ids.instance, i.ids.instance);
     assert_eq!(baseline.data.clone().into_inner(), i.cfg.encode().to_vec());
@@ -583,8 +624,16 @@ fn instances_do_not_share_accounts_and_cannot_be_given_each_others() {
         job_seed: job.seed,
         update: words(&(&u.rooted, &u.absent)),
     };
-    c.run(&ix, &[b.ids.instance, a.ids.store, job.account, CLOCK_01_PROGRAM_ACCOUNT_ID])
-        .expect_code(318, "A's store given to B");
+    c.run(
+        &ix,
+        &[
+            b.ids.instance,
+            a.ids.store,
+            job.account,
+            CLOCK_01_PROGRAM_ACCOUNT_ID,
+        ],
+    )
+    .expect_code(318, "A's store given to B");
 
     // B's attestation with A's records
     let claim = a.w.exec.account(ADDR);
@@ -652,7 +701,12 @@ fn account_storage_and_log_statements_carry_what_the_proofs_established() {
         .expect_ok("attest_log");
     let st = statement_of(&s.chain.data(pda(&program, &id))).expect("a statement");
     match st.verified {
-        Verified::Log { tx_index, log_index, address, .. } => {
+        Verified::Log {
+            tx_index,
+            log_index,
+            address,
+            ..
+        } => {
             assert_eq!((tx_index, log_index, address), (LOG_TX, 1, LOG_ADDR));
         }
         other => panic!("not a log statement: {other:?}"),
@@ -705,7 +759,9 @@ fn the_public_statement_does_not_reveal_who_asked_for_it() {
 fn every_instruction_fits_the_cycle_cap_at_mainnet_size() {
     let rows = le_sync_executor_tests::gas::table(512);
     for r in &rows {
-        let cycles = r.cycles.unwrap_or_else(|| panic!("{} was not measured", r.name));
+        let cycles = r
+            .cycles
+            .unwrap_or_else(|| panic!("{} was not measured", r.name));
         assert!(cycles < CYCLE_CAP, "{}: {cycles} cycles", r.name);
     }
 }

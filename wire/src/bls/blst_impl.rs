@@ -94,7 +94,13 @@ pub fn uncompress_g1(pk: &BlsPubkey) -> Option<[u8; G1_LEN]> {
     let mut out = [0u8; G1_LEN];
     // SAFETY: `out` has room for the serialized point.
     unsafe { blst_p1_affine_serialize(out.as_mut_ptr(), &a) };
-    Some(out)
+    let round_trip = g1_from_uncompressed(&out)?;
+    (g1_compress(&round_trip) == *pk).then_some(out)
+}
+
+/// Whether `raw` is the canonical uncompressed representation of `pk`.
+pub fn is_canonical_uncompressed_g1(pk: &BlsPubkey, raw: &[u8; G1_LEN]) -> bool {
+    g1_from_uncompressed(raw).is_some_and(|point| g1_compress(&point) == *pk)
 }
 
 fn p1_projective(a: &blst_p1_affine) -> blst_p1 {
@@ -210,6 +216,9 @@ impl Impl {
         msg: &Bytes32,
         sig: &BlsSignature,
     ) -> Result<[u8; PREPARED_LEN], Error> {
+        if !absent.well_formed() {
+            return Err(Error::AbsentKeys);
+        }
         if len == 0 || bits.len() * 8 != len {
             return Err(Error::BadSignature);
         }

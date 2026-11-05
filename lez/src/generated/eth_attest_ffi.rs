@@ -16,17 +16,14 @@ use sequencer_service_rpc::RpcClient as _;
 use wallet::WalletCore;
 
 static PROGRAM_IDL_JSON: &str = "{
-  \"version\": \"0.1.0\",
-  \"name\": \"eth_attest\",
+  \"accounts\": [],
+  \"errors\": [],
   \"instructions\": [
     {
-      \"name\": \"init_instance\",
       \"accounts\": [
         {
-          \"name\": \"instance\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": true,
+          \"name\": \"instance\",
           \"pda\": {
             \"seeds\": [
               {
@@ -34,13 +31,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"instance_id\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
-          \"name\": \"store\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": true,
+          \"name\": \"store\",
           \"pda\": {
             \"seeds\": [
               {
@@ -48,13 +45,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"store_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
-          \"name\": \"records\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": true,
+          \"name\": \"records\",
           \"pda\": {
             \"seeds\": [
               {
@@ -62,13 +59,15 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"records_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
+          \"init\": false,
           \"name\": \"clock\",
-          \"writable\": false,
           \"signer\": false,
-          \"init\": false
+          \"writable\": false
         }
       ],
       \"args\": [
@@ -166,16 +165,14 @@ static PROGRAM_IDL_JSON: &str = "{
             }
           }
         }
-      ]
+      ],
+      \"name\": \"init_instance\"
     },
     {
-      \"name\": \"begin_update\",
       \"accounts\": [
         {
-          \"name\": \"instance\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"instance\",
           \"pda\": {
             \"seeds\": [
               {
@@ -183,13 +180,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"instance_id\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"store\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"store\",
           \"pda\": {
             \"seeds\": [
               {
@@ -197,13 +194,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"store_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"job\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": true,
+          \"name\": \"job\",
           \"pda\": {
             \"seeds\": [
               {
@@ -211,13 +208,15 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"job_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
+          \"init\": false,
           \"name\": \"clock\",
-          \"writable\": false,
           \"signer\": false,
-          \"init\": false
+          \"writable\": false
         }
       ],
       \"args\": [
@@ -254,16 +253,14 @@ static PROGRAM_IDL_JSON: &str = "{
             \"vec\": \"u32\"
           }
         }
-      ]
+      ],
+      \"name\": \"begin_update\"
     },
     {
-      \"name\": \"miller_update\",
       \"accounts\": [
         {
-          \"name\": \"job\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"job\",
           \"pda\": {
             \"seeds\": [
               {
@@ -271,7 +268,9 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"job_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         }
       ],
       \"args\": [
@@ -284,16 +283,14 @@ static PROGRAM_IDL_JSON: &str = "{
             ]
           }
         }
-      ]
+      ],
+      \"name\": \"miller_update\"
     },
     {
-      \"name\": \"finish_update\",
       \"accounts\": [
         {
-          \"name\": \"instance\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"instance\",
           \"pda\": {
             \"seeds\": [
               {
@@ -301,13 +298,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"instance_id\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"store\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"store\",
           \"pda\": {
             \"seeds\": [
               {
@@ -315,13 +312,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"store_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
-          \"name\": \"job\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"job\",
           \"pda\": {
             \"seeds\": [
               {
@@ -329,13 +326,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"job_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
-          \"name\": \"records\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"records\",
           \"pda\": {
             \"seeds\": [
               {
@@ -343,13 +340,15 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"records_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         },
         {
+          \"init\": false,
           \"name\": \"clock\",
-          \"writable\": false,
           \"signer\": false,
-          \"init\": false
+          \"writable\": false
         }
       ],
       \"args\": [
@@ -412,16 +411,14 @@ static PROGRAM_IDL_JSON: &str = "{
             }
           }
         }
-      ]
+      ],
+      \"name\": \"finish_update\"
     },
     {
-      \"name\": \"attest_state\",
       \"accounts\": [
         {
-          \"name\": \"instance\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"instance\",
           \"pda\": {
             \"seeds\": [
               {
@@ -429,13 +426,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"instance_id\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"records\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"records\",
           \"pda\": {
             \"seeds\": [
               {
@@ -443,13 +440,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"records_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"statement\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": true,
+          \"name\": \"statement\",
           \"pda\": {
             \"seeds\": [
               {
@@ -457,7 +454,9 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"statement_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         }
       ],
       \"args\": [
@@ -503,16 +502,14 @@ static PROGRAM_IDL_JSON: &str = "{
             \"vec\": \"u32\"
           }
         }
-      ]
+      ],
+      \"name\": \"attest_state\"
     },
     {
-      \"name\": \"attest_log\",
       \"accounts\": [
         {
-          \"name\": \"instance\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"instance\",
           \"pda\": {
             \"seeds\": [
               {
@@ -520,13 +517,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"instance_id\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"records\",
-          \"writable\": false,
-          \"signer\": false,
           \"init\": false,
+          \"name\": \"records\",
           \"pda\": {
             \"seeds\": [
               {
@@ -534,13 +531,13 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"records_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": false
         },
         {
-          \"name\": \"statement\",
-          \"writable\": true,
-          \"signer\": false,
           \"init\": true,
+          \"name\": \"statement\",
           \"pda\": {
             \"seeds\": [
               {
@@ -548,7 +545,9 @@ static PROGRAM_IDL_JSON: &str = "{
                 \"path\": \"statement_seed\"
               }
             ]
-          }
+          },
+          \"signer\": false,
+          \"writable\": true
         }
       ],
       \"args\": [
@@ -594,9 +593,13 @@ static PROGRAM_IDL_JSON: &str = "{
             \"vec\": \"u32\"
           }
         }
-      ]
+      ],
+      \"name\": \"attest_log\"
     }
-  ]
+  ],
+  \"name\": \"eth_attest\",
+  \"types\": [],
+  \"version\": \"0.1.0\"
 }
 ";
 use serde::{Serialize, Deserialize};
@@ -722,7 +725,7 @@ fn init_wallet(v: &Value) -> Result<WalletCore, String> {
         return Err("wallet_path must be a non-empty path without null bytes".into());
     }
     let sequencer_url = v["sequencer_url"].as_str().ok_or("missing required field: sequencer_url")?;
-    std::env::set_var("NSSA_WALLET_HOME_DIR", wallet_path);
+    std::env::set_var("LEE_WALLET_HOME_DIR", wallet_path);
     std::env::set_var("NSSA_SEQUENCER_URL", sequencer_url);
     WalletCore::from_env().map_err(|e| format!("wallet init: {}", e))
 }
@@ -795,8 +798,8 @@ fn eth_attest_init_instance_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -804,7 +807,7 @@ fn eth_attest_init_instance_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let raw = wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let raw = wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         let tx_hash_hex = hex::encode(raw.0);
         let poller = wallet::poller::TxPoller::new(wallet.config(), wallet.sequencer_client.clone());
@@ -867,8 +870,8 @@ fn eth_attest_begin_update_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -876,7 +879,7 @@ fn eth_attest_begin_update_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let raw = wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let raw = wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         let tx_hash_hex = hex::encode(raw.0);
         let poller = wallet::poller::TxPoller::new(wallet.config(), wallet.sequencer_client.clone());
@@ -923,8 +926,8 @@ fn eth_attest_miller_update_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -932,7 +935,7 @@ fn eth_attest_miller_update_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let raw = wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let raw = wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         let tx_hash_hex = hex::encode(raw.0);
         let poller = wallet::poller::TxPoller::new(wallet.config(), wallet.sequencer_client.clone());
@@ -1005,8 +1008,8 @@ fn eth_attest_finish_update_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -1014,7 +1017,7 @@ fn eth_attest_finish_update_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let raw = wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let raw = wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         let tx_hash_hex = hex::encode(raw.0);
         let poller = wallet::poller::TxPoller::new(wallet.config(), wallet.sequencer_client.clone());
@@ -1077,8 +1080,8 @@ fn eth_attest_attest_state_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -1086,7 +1089,7 @@ fn eth_attest_attest_state_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let raw = wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let raw = wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         let tx_hash_hex = hex::encode(raw.0);
         let poller = wallet::poller::TxPoller::new(wallet.config(), wallet.sequencer_client.clone());
@@ -1149,8 +1152,8 @@ fn eth_attest_attest_log_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("nonces: {}", e))?;
         let mut signing_keys = Vec::new();
         for sid in &signer_ids {
-            let key = wallet.storage().user_data
-                .get_pub_account_signing_key(*sid)
+            let key = wallet
+                .get_account_public_signing_key(*sid)
                 .ok_or_else(|| format!("signing key not found for {}", sid))?;
             signing_keys.push(key);
         }
@@ -1158,7 +1161,7 @@ fn eth_attest_attest_log_impl(args: &str) -> Result<String, String> {
             .map_err(|e| format!("message: {:?}", e))?;
         let witness_set = WitnessSet::for_message(&message, &signing_keys);
         let tx = PublicTransaction::new(message, witness_set);
-        let raw = wallet.sequencer_client.send_transaction(common::transaction::NSSATransaction::Public(tx)).await
+        let raw = wallet.sequencer_client.send_transaction(common::transaction::LeeTransaction::Public(tx)).await
             .map_err(|e| format!("submit: {}", e))?;
         let tx_hash_hex = hex::encode(raw.0);
         let poller = wallet::poller::TxPoller::new(wallet.config(), wallet.sequencer_client.clone());
@@ -1186,7 +1189,7 @@ pub extern "C" fn eth_attest_program_id() -> *mut c_char {
         cwd.ancestors().take(6).find_map(|dir| std::fs::read(dir.join(rel)).ok())
     });
     let data = match data { Some(d) => d, None => return std::ptr::null_mut() };
-    let program = match Program::new(data) { Ok(p) => p, Err(_) => return std::ptr::null_mut() };
+    let program = match Program::new(data.into()) { Ok(p) => p, Err(_) => return std::ptr::null_mut() };
     let id = program.id();
     let hex: String = id.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("{:02x}", b)).collect();
     let json = json!({"program_id_hex": hex}).to_string();
@@ -1226,7 +1229,7 @@ fn eth_attest_inspect_account_impl(args: &str) -> Result<String, String> {
     let account = rt.block_on(async {
         wallet.sequencer_client.get_account(account_id).await.map_err(|e| format!("get_account: {}", e))
     })?;
-    let has_key = wallet.storage().user_data.get_pub_account_signing_key(account_id).is_some();
+    let has_key = wallet.get_account_public_signing_key(account_id).is_some();
     let data_len = account.data.len();
     let preview_len = data_len.min(32);
     let data_preview = hex::encode(&account.data[..preview_len]);
@@ -1262,7 +1265,7 @@ fn eth_attest_list_accounts_impl(args: &str) -> Result<String, String> {
     }
     let output = std::process::Command::new("wallet")
         .args(["account", "list"])
-        .env("NSSA_WALLET_HOME_DIR", wallet_path)
+        .env("LEE_WALLET_HOME_DIR", wallet_path)
         .output()
         .map_err(|e| format!("wallet CLI: {}", e))?;
     if !output.status.success() {
@@ -1334,7 +1337,7 @@ fn eth_attest_create_account_impl(args: &str) -> Result<String, String> {
     if let Some(label) = v["label"].as_str().filter(|s| !s.is_empty()) {
         cmd.args(["--label", label]);
     }
-    let output = cmd.env("NSSA_WALLET_HOME_DIR", wallet_path)
+    let output = cmd.env("LEE_WALLET_HOME_DIR", wallet_path)
         .output()
         .map_err(|e| format!("wallet CLI: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();

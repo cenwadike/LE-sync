@@ -1,0 +1,41 @@
+# Testnet run: the Logos testnet sequencer, real Sepolia data. Same file shape as local.toml.
+# Values marked FILL are written by scripts/deploy.sh or must be set once by hand.
+
+[env]
+name = "testnet"
+
+[lez]
+sequencer_url = ""                          # FILL: the Logos testnet sequencer URL
+account = ""                              # FILL: the funded signer (base58) that pays and signs
+lez_dir = "lez"                           # the scaffold project (where `lgs build` runs)
+program_id = ""                           # written by deploy.sh
+instance_id = ""                          # written by deploy.sh
+
+[eth]
+network = "sepolia"
+chain_id = 11155111
+source = "live"                           # live | replay
+beacon_url = "https://ethereum-sepolia-beacon-api.publicnode.com"
+beacon_url_2 = ""                         # a second, independent beacon API: deploy.sh refuses a root the two disagree on
+execution_url = "https://ethereum-sepolia-rpc.publicnode.com"
+replay_url = "http://127.0.0.1:5052"      # scripts/replay_server.sh, used when source = "replay"
+
+[instance]
+slots_per_epoch = 32
+epochs_per_period = 256
+sync_committee_size = 512
+genesis_time = ""                         # written by deploy.sh from the beacon API (verify it, see docs)
+genesis_validators_root = ""              # written by deploy.sh
+seconds_per_slot = ""                     # written by deploy.sh
+electra_fork_epoch = ""                   # written by deploy.sh
+forks = ""                                # written by deploy.sh: "electra:<epoch>:<version>,fulu:<epoch>:<version>"
+trusted_root = ""                         # written by deploy.sh: the finalized root at deploy time; another root is another instance
+
+[fixtures]
+address = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9"   # CONFIRM: WETH9 on Sepolia
+storage_slots = "0x0000000000000000000000000000000000000000000000000000000000000002"
+log_topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"   # ERC-20 Transfer
+
+[submitter]
+poll_seconds = 12                         # how often the background submitter looks
+defer_ms_max = 6000                       # holds back up to this long, a different time per operator, then looks again

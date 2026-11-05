@@ -1,0 +1,18 @@
+[package]
+name = "eth_attest_module"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate, like the Logos examples: the empty table keeps Cargo from adopting a parent
+# workspace.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+serde_json = "1"
+eth-attest-ops = { path = "../ops" }
+# The same path form the Logos examples use. The directory is staged by logos-module-builder
+# (its `rust-sdk-src` output) before the lockfile is made.
+logos-rust-sdk = { path = "../logos-rust-sdk-src" }

@@ -1,0 +1,2 @@
+[env]
+LOGOS_BLOCKCHAIN_CIRCUITS = { value = "module/ops/.logos-blockchain-circuits", relative = true }

@@ -3,11 +3,11 @@ version = "0.2.0"
 
 [repos.lez]
 source = "https://github.com/logos-blockchain/logos-execution-zone.git"
-pin = "cf3639d8252040d13b3d4e933feb19b42c76e14a"
+pin = "a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a"
 
 [repos.spel]
 source = "https://github.com/logos-co/spel.git"
-pin = "73fc462eb8f0a4d00f1a846437c627ec2e523f83"
+pin = "4964304095875774a071c300a9ebf9feebf18f73"
 
 [repos.basecamp]
 source = "https://github.com/logos-co/logos-basecamp.git"

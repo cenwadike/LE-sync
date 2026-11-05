@@ -51,7 +51,7 @@ fn cc() -> u64 {
 mod blst_impl;
 /// Host helper for the rooted update hints (`rooted::absent_wire`).
 #[cfg(feature = "bls-blst")]
-pub use blst_impl::uncompress_g1;
+pub use blst_impl::{is_canonical_uncompressed_g1, uncompress_g1};
 
 /// On-curve decompression only. Subgroup membership comes from the authenticated committee.
 #[cfg(feature = "bls-zk")]

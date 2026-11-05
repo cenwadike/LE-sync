@@ -30,3 +30,6 @@ receipts/
 fixture/
 fixture-log/
 consensus-spec-tests/
+/module/ops/.logos-blockchain-circuits/
+.eth-attest-state/
+.run/

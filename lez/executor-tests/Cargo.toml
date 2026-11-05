@@ -17,14 +17,14 @@ le-sync-wire = { path = "../../wire", features = ["bls-blst"] }
 # Seeded committees, a real BLS signer, BeaconState-shaped trees and tries.
 le-sync-testkit = { path = "../../testkit" }
 
-# LEZ v0.1.2, the same tag as the program and the scaffold pin (cf3639d).
-nssa = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.1.2" }
-nssa_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.1.2" }
+# LEZ v0.2.0, the same tag as the program and scaffold pin.
+nssa = { package = "lee", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0" }
+nssa_core = { package = "lee_core", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0" }
 # `compute_pda`, as the generated client uses it.
-spel-framework-core = { git = "https://github.com/logos-co/spel.git", rev = "73fc462eb8f0a4d00f1a846437c627ec2e523f83" }
+spel-framework-core = { git = "https://github.com/logos-co/spel.git", rev = "4964304095875774a071c300a9ebf9feebf18f73" }
 
 # The built program: `ETH_ATTEST_ELF`, from `lez/methods` (risc0-build compiles the guest).
-example_program_deployment_methods = { path = "../methods" }
+execute_attestation_deployment_methods = { path = "../methods" }
 
 risc0-zkvm = { version = "=3.0.5", features = ["std"] }
 serde = { version = "1", features = ["derive"] }

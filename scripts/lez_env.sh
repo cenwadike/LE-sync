@@ -33,7 +33,7 @@ fi
 LEZ_DIR="${LEZ_DIR:-./lez}"
 LEZ_PROGRAM="${LEZ_PROGRAM:-lez_counter}"
 LEZ_IDL="${LEZ_IDL:-idl/${LEZ_PROGRAM}.json}"
-LEZ_BIN="${LEZ_BIN:-target/riscv-guest/example_program_deployment_methods/example_program_deployment_programs/riscv32im-risc0-zkvm-elf/release/${LEZ_PROGRAM}.bin}"
+LEZ_BIN="${LEZ_BIN:-target/riscv-guest/execute_attestation_deployment_methods/execute_attestation_deployment_programs/riscv32im-risc0-zkvm-elf/release/${LEZ_PROGRAM}.bin}"
 LEZ_WAIT="${LEZ_WAIT:-20}"
 LEZ_AUTH="${LEZ_AUTH:-}"
 LEZ_PDA="${LEZ_PDA:-}"

@@ -1,0 +1,22 @@
+{
+  "name": "eth_attest_module",
+  "version": "0.1.0",
+  "description": "Trustless Ethereum state attestation for LEZ: follow Ethereum finality, advance an eth_attest instance, attest account and storage state",
+  "author": "le-sync",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "general",
+  "main": "eth_attest_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "lidl": "rust-lib/eth_attest_module.lidl",
+    "rust": { "crate": "rust-lib", "staticlib": "eth_attest_module" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
